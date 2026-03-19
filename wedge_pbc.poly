@@ -1,0 +1,24 @@
+# wedge_pbc.poly - Test: 45-degree wedge with arcs and PBC
+# Inner radius=1, outer radius=3
+# Radial boundaries at 0deg (marker 10) and 45deg (marker 11) are periodic
+4  2  0  1
+1   1.0        0.0        10
+2   3.0        0.0        10
+3   0.70710678 0.70710678 11
+4   2.12132034 2.12132034 11
+# Segments (radial lines)
+2  1
+1   1   2   10
+2   3   4   11
+# Holes
+0
+# Regions
+1
+1   1.5  0.3  1  0.1
+# Arcs
+2  1
+1   2   4   45.0   10.0   0
+2   1   3   45.0   10.0   0
+# PBCs
+1
+1   10   11   0
