@@ -2180,6 +2180,10 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     for(int si=0;si<(int)mesh.segments.size();si++)
         edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
 
+    // Shell tracking for acute-angle wedges (populated before refinement loop)
+    std::unordered_set<int> acuteApices;
+    std::vector<int> shellApex(mesh.vertices.size(), -1);
+
     // Core segment split helper (no PBC synchronization)
     auto splitSegmentCore=[&](int si, std::vector<int>& outAffected, int hintTri=-1) -> int {
         auto seg=mesh.segments[si]; // copy before modifying
@@ -2201,6 +2205,15 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             return -1;
         }
         steinerCount++;
+        // Propagate shell membership: if either endpoint belongs to an
+        // acute-angle shell, the midpoint inherits that membership.
+        shellApex.resize(mesh.vertices.size(), -1);
+        {
+            int a0=(seg.v0<nInputVerts)?seg.v0:shellApex[seg.v0];
+            int a1=(seg.v1<nInputVerts)?seg.v1:shellApex[seg.v1];
+            if(a0>=0 && acuteApices.count(a0)) shellApex[midIdx]=a0;
+            else if(a1>=0 && acuteApices.count(a1)) shellApex[midIdx]=a1;
+        }
         Segment s1{seg.v0,midIdx,seg.marker,seg.lfs,seg.pbc_partner,seg.pbc_type};
         Segment s2{midIdx,seg.v1,seg.marker,seg.lfs,seg.pbc_partner,seg.pbc_type};
         mesh.segments[si]=s1;
@@ -2275,6 +2288,31 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         return -1;
     };
 
+    // Detect acute apices: input vertices where two segments meet at < ~60°.
+    // Triangles inside these small-angle wedges can't be improved by refinement;
+    // tracking "shell membership" lets us skip them (Shewchuk's concentric shells).
+    {
+        std::unordered_map<int, std::vector<int>> vertSegs;
+        for(int si=0;si<(int)mesh.segments.size();si++){
+            vertSegs[mesh.segments[si].v0].push_back(si);
+            vertSegs[mesh.segments[si].v1].push_back(si);
+        }
+        for(auto& [vi, slist] : vertSegs){
+            if(vi>=nInputVerts || slist.size()<2) continue;
+            for(int i=0;i<(int)slist.size();i++)
+                for(int j=i+1;j<(int)slist.size();j++){
+                    int oi=(mesh.segments[slist[i]].v0==vi)?mesh.segments[slist[i]].v1:mesh.segments[slist[i]].v0;
+                    int oj=(mesh.segments[slist[j]].v0==vi)?mesh.segments[slist[j]].v1:mesh.segments[slist[j]].v0;
+                    double dix=mesh.vertices[oi].x-mesh.vertices[vi].x, diy=mesh.vertices[oi].y-mesh.vertices[vi].y;
+                    double djx=mesh.vertices[oj].x-mesh.vertices[vi].x, djy=mesh.vertices[oj].y-mesh.vertices[vi].y;
+                    double dot=dix*djx+diy*djy;
+                    double cross=dix*djy-diy*djx;
+                    if(dot>0 && std::abs(cross)<dot*1.15) // angle < ~60°
+                        acuteApices.insert(vi);
+                }
+        }
+    }
+
     using PQItem = std::tuple<double, int, int>; // metric, triIdx, generation
     std::priority_queue<PQItem> pq;
 
@@ -2322,6 +2360,11 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             // Check if both edges at the smallest-angle vertex are segments
             int va=bt.v[minV], vb=bt.v[(minV+1)%3], vc=bt.v[(minV+2)%3];
             if(constrainedEdges.count(edgeKey(va,vb)) && constrainedEdges.count(edgeKey(va,vc))){
+                dbgSkip++; continue;
+            }
+            // Check if worst-angle vertex is inside a small-angle shell
+            // (Steiner point descended from an acute apex via segment splits)
+            if(va<(int)shellApex.size() && shellApex[va]>=0){
                 dbgSkip++; continue;
             }
         }
