@@ -99,6 +99,8 @@ struct Options {
     bool no_holes      = false;
     bool no_steiner    = false;
     bool neighbors     = false;
+    bool clean_pslg    = false;
+    double clean_tol   = -1.0;  // -1 = auto (bboxDiag * 1e-6)
     int  first_index   = 1;
 };
 
@@ -2790,9 +2792,192 @@ Options parseOptions(const std::string& switchStr){
             case 'O': opts.no_holes=true; break;
             case 'Y': opts.no_steiner=true; break;
             case 'n': opts.neighbors=true; break;
+            case 'C':
+                opts.clean_pslg=true;
+                if(i<(int)switchStr.size()&&(std::isdigit(switchStr[i])||switchStr[i]=='.')){
+                    std::string num;
+                    while(i<(int)switchStr.size()&&(std::isdigit(switchStr[i])||switchStr[i]=='.'))
+                        num+=switchStr[i++];
+                    opts.clean_tol=std::stod(num);
+                } break;
         }
     }
     return opts;
+}
+
+// ============================================================
+// PSLG cleanup (-C flag): merge near-duplicate nodes, split
+// segments at intersections, remove duplicate segments.
+// Adapted from FEMM's EnforcePSLG().
+// ============================================================
+
+void cleanPSLG(Mesh& mesh, double tol, bool quiet){
+    auto& pts = mesh.vertices;
+    auto& segs = mesh.segments;
+    int nv = (int)pts.size();
+
+    // Compute auto tolerance if not specified
+    if(tol < 0){
+        double minX=pts[0].x, maxX=pts[0].x, minY=pts[0].y, maxY=pts[0].y;
+        for(auto& p : pts){
+            minX=std::min(minX,p.x); maxX=std::max(maxX,p.x);
+            minY=std::min(minY,p.y); maxY=std::max(maxY,p.y);
+        }
+        tol = std::sqrt((maxX-minX)*(maxX-minX)+(maxY-minY)*(maxY-minY)) * 1e-6;
+    }
+    double tol2 = tol * tol;
+
+    int mergedNodes=0, splitSegs=0, removedSegs=0;
+
+    // 1. Merge near-duplicate nodes
+    std::vector<int> remap(nv);
+    std::iota(remap.begin(), remap.end(), 0);
+    for(int i=0; i<nv; i++){
+        if(remap[i] != i) continue; // already merged
+        for(int j=i+1; j<nv; j++){
+            if(remap[j] != j) continue;
+            double dx=pts[j].x-pts[i].x, dy=pts[j].y-pts[i].y;
+            if(dx*dx+dy*dy < tol2){
+                remap[j] = i;
+                mergedNodes++;
+            }
+        }
+    }
+    // Apply remap to segments
+    for(auto& s : segs){
+        s.v0 = remap[s.v0];
+        s.v1 = remap[s.v1];
+    }
+    // Apply remap to holes and regions
+    // (holes/regions use coordinates, not indices, so no remap needed)
+
+    // 2. Remove degenerate segments (both endpoints same after merge)
+    {
+        std::vector<Segment> good;
+        for(auto& s : segs)
+            if(s.v0 != s.v1) good.push_back(s);
+        removedSegs += (int)segs.size() - (int)good.size();
+        segs = std::move(good);
+    }
+
+    // 3. Remove duplicate segments
+    {
+        std::set<std::pair<int,int>> seen;
+        std::vector<Segment> good;
+        for(auto& s : segs){
+            auto k = edgeKey(s.v0, s.v1);
+            if(seen.insert(k).second) good.push_back(s);
+            else removedSegs++;
+        }
+        segs = std::move(good);
+    }
+
+    // 4. Split segments at near-coincident nodes (node lies on segment)
+    {
+        bool changed = true;
+        while(changed){
+            changed = false;
+            for(int si=0; si<(int)segs.size(); si++){
+                int v0=segs[si].v0, v1=segs[si].v1;
+                double ax=pts[v0].x, ay=pts[v0].y;
+                double bx=pts[v1].x, by=pts[v1].y;
+                double dx=bx-ax, dy=by-ay;
+                double len2=dx*dx+dy*dy;
+                if(len2 < tol2) continue;
+                for(int i=0; i<(int)pts.size(); i++){
+                    if(i==v0 || i==v1) continue;
+                    if(remap[i] != i && i < nv) continue; // merged away
+                    double px=pts[i].x-ax, py=pts[i].y-ay;
+                    // Distance from point to line segment
+                    double t = (dx*px+dy*py)/len2;
+                    if(t <= tol/std::sqrt(len2) || t >= 1.0-tol/std::sqrt(len2)) continue;
+                    double cross = dx*py - dy*px;
+                    if(cross*cross > tol2*len2) continue;
+                    // Point i is on segment si — split it
+                    Segment s2 = segs[si];
+                    segs[si].v1 = i;
+                    s2.v0 = i;
+                    segs.push_back(s2);
+                    splitSegs++;
+                    changed = true;
+                    break; // restart this segment (now shorter)
+                }
+            }
+        }
+    }
+
+    // 5. Split segments at segment-segment intersections
+    {
+        bool changed = true;
+        while(changed){
+            changed = false;
+            for(int i=0; i<(int)segs.size() && !changed; i++){
+                double ax=pts[segs[i].v0].x, ay=pts[segs[i].v0].y;
+                double bx=pts[segs[i].v1].x, by=pts[segs[i].v1].y;
+                for(int j=i+1; j<(int)segs.size() && !changed; j++){
+                    // Skip if they share an endpoint
+                    if(segs[i].v0==segs[j].v0 || segs[i].v0==segs[j].v1 ||
+                       segs[i].v1==segs[j].v0 || segs[i].v1==segs[j].v1) continue;
+                    double cx=pts[segs[j].v0].x, cy=pts[segs[j].v0].y;
+                    double dx2=pts[segs[j].v1].x, dy2=pts[segs[j].v1].y;
+                    // Compute intersection
+                    double d1x=bx-ax, d1y=by-ay;
+                    double d2x=dx2-cx, d2y=dy2-cy;
+                    double denom=d1x*d2y-d1y*d2x;
+                    if(std::abs(denom) < 1e-15) continue;
+                    double t=((cx-ax)*d2y-(cy-ay)*d2x)/denom;
+                    double u=((cx-ax)*d1y-(cy-ay)*d1x)/denom;
+                    if(t<=0 || t>=1 || u<=0 || u>=1) continue;
+                    // Intersection at (ax+t*d1x, ay+t*d1y)
+                    double ix=ax+t*d1x, iy=ay+t*d1y;
+                    // Check if intersection is near an existing node
+                    int nearNode=-1;
+                    for(int k=0;k<(int)pts.size();k++){
+                        double ex=pts[k].x-ix, ey=pts[k].y-iy;
+                        if(ex*ex+ey*ey < tol2){ nearNode=k; break; }
+                    }
+                    if(nearNode<0){
+                        nearNode=(int)pts.size();
+                        pts.push_back({ix,iy,nearNode,0,{}});
+                    }
+                    // Split both segments at the intersection
+                    Segment si2=segs[i]; si2.v0=nearNode;
+                    segs[i].v1=nearNode;
+                    segs.push_back(si2);
+                    Segment sj2=segs[j]; sj2.v0=nearNode;
+                    segs[j].v1=nearNode;
+                    segs.push_back(sj2);
+                    splitSegs+=2;
+                    changed=true;
+                }
+            }
+        }
+    }
+
+    // Compact: remove merged-away vertices and re-index
+    if(mergedNodes > 0){
+        std::vector<int> newIdx(pts.size(), -1);
+        std::vector<Point> newPts;
+        for(int i=0; i<(int)pts.size(); i++){
+            int target = (i < nv) ? remap[i] : i;
+            if(target != i) continue; // skip merged
+            newIdx[i] = (int)newPts.size();
+            pts[i].id = (int)newPts.size();
+            newPts.push_back(pts[i]);
+        }
+        // Map merged indices through to their target's new index
+        for(int i=0; i<nv; i++)
+            if(remap[i] != i) newIdx[i] = newIdx[remap[i]];
+        // Also map new intersection points
+        for(int i=nv; i<(int)pts.size(); i++)
+            if(newIdx[i]<0){ newIdx[i]=(int)newPts.size(); pts[i].id=(int)newPts.size(); newPts.push_back(pts[i]); }
+        for(auto& s : segs){ s.v0=newIdx[s.v0]; s.v1=newIdx[s.v1]; }
+        pts = std::move(newPts);
+    }
+
+    if(!quiet && (mergedNodes>0 || splitSegs>0 || removedSegs>0))
+        std::cerr<<"  PSLG cleanup: merged "<<mergedNodes<<" nodes, split "
+                 <<splitSegs<<" segments, removed "<<removedSegs<<" duplicates\n";
 }
 
 // ============================================================
@@ -2816,6 +3001,9 @@ void printUsage(){
 "  -I    Suppress iteration numbers on output file names.\n"
 "  -Y    No Steiner points on boundary segments.\n"
 "  -n    Output .neigh file.\n"
+"  -C    Clean PSLG: merge near-duplicate nodes, split intersecting\n"
+"        segments, remove duplicates. Optional tolerance (e.g. -C0.001);\n"
+"        default is bounding-box diagonal * 1e-6.\n"
 "\n"
 "Input: .node or .poly files. Output: .1.node .1.ele [.1.edge] [.1.neigh] [.1.poly]\n";
 }
@@ -2964,6 +3152,12 @@ int main(int argc, char* argv[]){
         tPrev = now;
         return ms;
     };
+
+    // 0. Optional PSLG cleanup
+    if(opts.clean_pslg && opts.pslg){
+        cleanPSLG(mesh, opts.clean_tol, opts.quiet);
+        if(!opts.quiet) std::cerr<<"  PSLG cleanup: "<<elapsed()<<" ms\n";
+    }
 
     // 1. Delaunay triangulation
     buildDelaunay(mesh);
