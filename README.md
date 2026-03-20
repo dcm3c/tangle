@@ -59,6 +59,7 @@ tangle [switches] inputfile
 | `-e`   | Output edges (.edge file) |
 | `-n`   | Output triangle neighbors (.neigh file) |
 | `-z`   | Zero-indexed output (default is 1-indexed) |
+| `-C`   | PSLG cleanup: merge near-duplicate nodes, split intersecting segments, remove duplicates. Optional tolerance (e.g. `-C0.001`); default is bounding-box diagonal × 1e-6 |
 | `-Y`   | No Steiner points on boundary segments |
 | `-Q`   | Quiet mode |
 | `-I`   | Suppress iteration numbers on output filenames |

@@ -82,6 +82,8 @@ class Options:
     no_holes: bool = False
     no_steiner: bool = False
     neighbors: bool = False
+    clean_pslg: bool = False
+    clean_tol: float = -1.0  # -1 = auto (bboxDiag * 1e-6)
     first_index: int = 1
 
 
@@ -343,6 +345,177 @@ class Mesh:
                    (t.v[j] == v and t.v[(j + 1) % 3] == u):
                     return True
         return False
+
+
+# ============================================================
+# PSLG cleanup (-C flag)
+# ============================================================
+
+def clean_pslg(mesh, tol, quiet):
+    pts = mesh.vertices
+    segs = mesh.segments
+    nv = len(pts)
+
+    # Compute auto tolerance if not specified
+    if tol < 0:
+        min_x = min(p.x for p in pts)
+        max_x = max(p.x for p in pts)
+        min_y = min(p.y for p in pts)
+        max_y = max(p.y for p in pts)
+        tol = math.sqrt((max_x - min_x)**2 + (max_y - min_y)**2) * 1e-6
+    tol2 = tol * tol
+
+    merged_nodes = 0
+    split_segs = 0
+    removed_segs = 0
+
+    # 1. Merge near-duplicate nodes
+    remap = list(range(nv))
+    for i in range(nv):
+        if remap[i] != i:
+            continue
+        for j in range(i + 1, nv):
+            if remap[j] != j:
+                continue
+            dx = pts[j].x - pts[i].x
+            dy = pts[j].y - pts[i].y
+            if dx * dx + dy * dy < tol2:
+                remap[j] = i
+                merged_nodes += 1
+
+    # Apply remap to segments
+    for s in segs:
+        s.v0 = remap[s.v0]
+        s.v1 = remap[s.v1]
+
+    # 2. Remove degenerate segments
+    good = [s for s in segs if s.v0 != s.v1]
+    removed_segs += len(segs) - len(good)
+    mesh.segments = good
+    segs = mesh.segments
+
+    # 3. Remove duplicate segments
+    seen = set()
+    good = []
+    for s in segs:
+        k = edge_key(s.v0, s.v1)
+        if k not in seen:
+            seen.add(k)
+            good.append(s)
+        else:
+            removed_segs += 1
+    mesh.segments = good
+    segs = mesh.segments
+
+    # 4. Split segments at near-coincident nodes
+    changed = True
+    while changed:
+        changed = False
+        for si in range(len(segs)):
+            v0, v1 = segs[si].v0, segs[si].v1
+            ax, ay = pts[v0].x, pts[v0].y
+            bx, by = pts[v1].x, pts[v1].y
+            dx, dy = bx - ax, by - ay
+            len2 = dx * dx + dy * dy
+            if len2 < tol2:
+                continue
+            sqrt_len = math.sqrt(len2)
+            for i in range(len(pts)):
+                if i == v0 or i == v1:
+                    continue
+                if i < nv and remap[i] != i:
+                    continue
+                px, py = pts[i].x - ax, pts[i].y - ay
+                t = (dx * px + dy * py) / len2
+                if t <= tol / sqrt_len or t >= 1.0 - tol / sqrt_len:
+                    continue
+                cross = dx * py - dy * px
+                if cross * cross > tol2 * len2:
+                    continue
+                # Point i is on segment si — split it
+                s2 = Segment(i, segs[si].v1, segs[si].marker)
+                segs[si] = Segment(segs[si].v0, i, segs[si].marker)
+                segs.append(s2)
+                split_segs += 1
+                changed = True
+                break
+
+    # 5. Split segments at segment-segment intersections
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(segs)):
+            if changed:
+                break
+            ax, ay = pts[segs[i].v0].x, pts[segs[i].v0].y
+            bx, by = pts[segs[i].v1].x, pts[segs[i].v1].y
+            for j in range(i + 1, len(segs)):
+                if changed:
+                    break
+                # Skip if they share an endpoint
+                if (segs[i].v0 in (segs[j].v0, segs[j].v1) or
+                    segs[i].v1 in (segs[j].v0, segs[j].v1)):
+                    continue
+                cx, cy = pts[segs[j].v0].x, pts[segs[j].v0].y
+                d2x, d2y = pts[segs[j].v1].x, pts[segs[j].v1].y
+                d1x, d1y = bx - ax, by - ay
+                ddx, ddy = d2x - cx, d2y - cy
+                denom = d1x * ddy - d1y * ddx
+                if abs(denom) < 1e-15:
+                    continue
+                t = ((cx - ax) * ddy - (cy - ay) * ddx) / denom
+                u = ((cx - ax) * d1y - (cy - ay) * d1x) / denom
+                if t <= 0 or t >= 1 or u <= 0 or u >= 1:
+                    continue
+                ix, iy = ax + t * d1x, ay + t * d1y
+                # Check if near existing node
+                near_node = -1
+                for k in range(len(pts)):
+                    ex, ey = pts[k].x - ix, pts[k].y - iy
+                    if ex * ex + ey * ey < tol2:
+                        near_node = k
+                        break
+                if near_node < 0:
+                    near_node = len(pts)
+                    pts.append(Point(ix, iy, near_node, 0))
+                # Split both segments
+                s_i2 = Segment(near_node, segs[i].v1, segs[i].marker)
+                segs[i] = Segment(segs[i].v0, near_node, segs[i].marker)
+                segs.append(s_i2)
+                s_j2 = Segment(near_node, segs[j].v1, segs[j].marker)
+                segs[j] = Segment(segs[j].v0, near_node, segs[j].marker)
+                segs.append(s_j2)
+                split_segs += 2
+                changed = True
+
+    # Compact: remove merged-away vertices and re-index
+    if merged_nodes > 0:
+        new_idx = [-1] * len(pts)
+        new_pts = []
+        for i in range(len(pts)):
+            target = remap[i] if i < nv else i
+            if target != i:
+                continue
+            new_idx[i] = len(new_pts)
+            pts[i].id = len(new_pts)
+            new_pts.append(pts[i])
+        for i in range(nv):
+            if remap[i] != i:
+                new_idx[i] = new_idx[remap[i]]
+        for i in range(nv, len(pts)):
+            if new_idx[i] < 0:
+                new_idx[i] = len(new_pts)
+                pts[i].id = len(new_pts)
+                new_pts.append(pts[i])
+        for s in segs:
+            s.v0 = new_idx[s.v0]
+            s.v1 = new_idx[s.v1]
+        mesh.vertices = new_pts
+
+    if not quiet and (merged_nodes > 0 or split_segs > 0 or removed_segs > 0):
+        print(f"  PSLG cleanup: merged {merged_nodes} nodes, split "
+              f"{split_segs} segments, removed {removed_segs} duplicates",
+              file=sys.stderr)
 
 
 # ============================================================
@@ -2100,6 +2273,29 @@ def refine_quality(mesh, opts, n_input_verts):
     for s in mesh.segments:
         constrained_edges.add(edge_key(s.v0, s.v1))
 
+    # Detect acute apices and initialize shell tracking (concentric shells)
+    acute_apices = set()
+    vert_segs = {}
+    for si in range(len(mesh.segments)):
+        for v in (mesh.segments[si].v0, mesh.segments[si].v1):
+            vert_segs.setdefault(v, []).append(si)
+    for vi, slist in vert_segs.items():
+        if vi >= n_input_verts or len(slist) < 2:
+            continue
+        for i in range(len(slist)):
+            for j in range(i + 1, len(slist)):
+                oi = mesh.segments[slist[i]].v1 if mesh.segments[slist[i]].v0 == vi else mesh.segments[slist[i]].v0
+                oj = mesh.segments[slist[j]].v1 if mesh.segments[slist[j]].v0 == vi else mesh.segments[slist[j]].v0
+                dix = mesh.vertices[oi].x - mesh.vertices[vi].x
+                diy = mesh.vertices[oi].y - mesh.vertices[vi].y
+                djx = mesh.vertices[oj].x - mesh.vertices[vi].x
+                djy = mesh.vertices[oj].y - mesh.vertices[vi].y
+                dot = dix * djx + diy * djy
+                cross = dix * djy - diy * djx
+                if dot > 0 and abs(cross) < dot * 1.15:  # angle < ~60°
+                    acute_apices.add(vi)
+    shell_apex = [-1] * len(mesh.vertices)
+
     gxmin -= 1
     gymin -= 1
     gxmax += 1
@@ -2169,6 +2365,15 @@ def refine_quality(mesh, opts, n_input_verts):
             grid_add_seg(si)
             return -1
         steiner_count[0] += 1
+        # Propagate shell membership for acute-angle wedge tracking
+        while len(shell_apex) <= mid_idx:
+            shell_apex.append(-1)
+        a0 = seg.v0 if seg.v0 < n_input_verts else shell_apex[seg.v0]
+        a1 = seg.v1 if seg.v1 < n_input_verts else shell_apex[seg.v1]
+        if a0 >= 0 and a0 in acute_apices:
+            shell_apex[mid_idx] = a0
+        elif a1 >= 0 and a1 in acute_apices:
+            shell_apex[mid_idx] = a1
         s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_partner, seg.pbc_type)
         s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_partner, seg.pbc_type)
         mesh.segments[si] = s1
@@ -2280,6 +2485,10 @@ def refine_quality(mesh, opts, n_input_verts):
             vc_v = bt.v[(min_v + 2) % 3]
             if (edge_key(va, vb_v) in constrained_edges and
                 edge_key(va, vc_v) in constrained_edges):
+                dbg_skip += 1
+                continue
+            # Check if worst-angle vertex is inside a small-angle shell
+            if va < len(shell_apex) and shell_apex[va] >= 0:
                 dbg_skip += 1
                 continue
 
@@ -2706,6 +2915,14 @@ def parse_options(switch_str):
             opts.no_steiner = True
         elif c == 'n':
             opts.neighbors = True
+        elif c == 'C':
+            opts.clean_pslg = True
+            num = ''
+            while i < len(switch_str) and (switch_str[i].isdigit() or switch_str[i] == '.'):
+                num += switch_str[i]
+                i += 1
+            if num:
+                opts.clean_tol = float(num)
     return opts
 
 
@@ -2892,6 +3109,12 @@ def main():
         ms = (now - t_prev[0]) * 1000
         t_prev[0] = now
         return ms
+
+    # 0. Optional PSLG cleanup
+    if opts.clean_pslg and opts.pslg:
+        clean_pslg(mesh, opts.clean_tol, opts.quiet)
+        if not opts.quiet:
+            print(f"  PSLG cleanup: {elapsed():.1f} ms", file=sys.stderr)
 
     # 1. Delaunay triangulation
     build_delaunay(mesh)
