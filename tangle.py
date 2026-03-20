@@ -2487,10 +2487,14 @@ def refine_quality(mesh, opts, n_input_verts):
                 edge_key(va, vc_v) in constrained_edges):
                 dbg_skip += 1
                 continue
-            # Check if worst-angle vertex is inside a small-angle shell
+            # Check if worst-angle vertex is inside a small-angle shell.
+            # Only skip if at least one edge at the vertex is constrained —
+            # this limits suppression to triangles directly on the shell boundary.
             if va < len(shell_apex) and shell_apex[va] >= 0:
-                dbg_skip += 1
-                continue
+                if (edge_key(va, vb_v) in constrained_edges or
+                    edge_key(va, vc_v) in constrained_edges):
+                    dbg_skip += 1
+                    continue
 
         # Compute circumcenter or off-center
         if ang_viol:

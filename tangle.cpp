@@ -2363,9 +2363,14 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
                 dbgSkip++; continue;
             }
             // Check if worst-angle vertex is inside a small-angle shell
-            // (Steiner point descended from an acute apex via segment splits)
+            // (Steiner point descended from an acute apex via segment splits).
+            // Only skip if at least one edge at the vertex is constrained —
+            // this limits suppression to triangles directly on the shell boundary,
+            // not triangles that merely happen to touch a shell vertex.
             if(va<(int)shellApex.size() && shellApex[va]>=0){
-                dbgSkip++; continue;
+                if(constrainedEdges.count(edgeKey(va,vb)) || constrainedEdges.count(edgeKey(va,vc))){
+                    dbgSkip++; continue;
+                }
             }
         }
 
