@@ -3069,6 +3069,24 @@ int main(int argc, char* argv[]){
 
     Options opts=parseOptions(switchStr);
 
+    // KLUDGE: FEMM compatibility hack — REMOVE THIS LATER.
+    // FEMM adds 3° to the -q angle when calling Triangle 1.6, because 1.6
+    // produces sparser meshes than 1.3.  Tangle's mesh density is closer to
+    // 1.3, so the extra 3° produces overly dense meshes.  When tangle is
+    // invoked as "triangle" (drop-in replacement), subtract the 3° back out.
+    {
+        std::string prog=argv[0];
+        auto slash=prog.find_last_of("/\\");
+        if(slash!=std::string::npos) prog=prog.substr(slash+1);
+        auto dotpos=prog.rfind('.');
+        if(dotpos!=std::string::npos) prog=prog.substr(0,dotpos);
+        for(auto& ch:prog) ch=std::tolower(ch);
+        if(prog=="triangle"){
+            if(opts.quality && opts.min_angle>3.0)
+                opts.min_angle-=3.0;
+        }
+    }
+
     std::string base=inputFile, ext;
     auto dot=base.rfind('.');
     if(dot!=std::string::npos){ext=base.substr(dot);base=base.substr(0,dot);}
