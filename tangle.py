@@ -49,7 +49,6 @@ import math
 import time
 import bisect
 from collections import deque
-from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from heapq import heappush, heappop
@@ -59,6 +58,15 @@ from heapq import heappush, heappop
 # for dimensionless comparisons.
 EPS_SCALE = 1e-10
 EPS = EPS_SCALE
+
+# Relative tolerance for "too close" geometry: used both by cleanPSLG
+# (merge nodes within bboxDiag * CLOSE_ENOUGH) and by quality refinement
+# (reduce angle threshold for triangles with all edges < bboxDiag * CLOSE_ENOUGH).
+CLOSE_ENOUGH = 1e-6
+
+# Reduced minimum angle (degrees) for tiny triangles in locally dense
+# regions where the full minimum angle is unachievable.
+TINY_TRI_ANGLE = 15.0
 
 
 # ============================================================
@@ -107,8 +115,8 @@ class Segment:
     v1: int
     marker: int = 0
     lfs: float = -1.0  # per-segment LFS constraint (-1 = none)
-    pbc_partner: int = -1  # index of paired PBC segment (-1 = none)
     pbc_type: int = -1     # 0=periodic, 1=anti-periodic (-1 = none)
+    no_split: bool = False # true for AGE chord segments (must stay uniformly spaced)
 
 
 @dataclass
@@ -136,10 +144,19 @@ class Triangle:
 
 
 def orient2d_xy(ax, ay, bx, by, cx, cy):
-    """Lightweight orient2d for triangle walks — no exact fallback needed because
-    the walk is intrinsically robust to occasional sign errors (it self-corrects
-    or falls through to the linear scan).  Also avoids constructing a Point."""
-    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    """orient2d on raw coordinates — avoids constructing a Point.
+    Same exact-arithmetic fallback as orient2d."""
+    Ax, Ay = bx - ax, by - ay
+    Bx, By = cx - ax, cy - ay
+    det = Ax * By - Bx * Ay
+    M = max(abs(Ax), abs(Ay), abs(Bx), abs(By))
+    if abs(det) > 6.662e-16 * M * M:
+        return det
+    fAx = Decimal(bx) - Decimal(ax)
+    fAy = Decimal(by) - Decimal(ay)
+    fBx = Decimal(cx) - Decimal(ax)
+    fBy = Decimal(cy) - Decimal(ay)
+    return float(fAx * fBy - fBx * fAy)
 
 
 def orient2d(a, b, c):
@@ -362,19 +379,24 @@ def clean_pslg(mesh, tol, quiet):
         max_x = max(p.x for p in pts)
         min_y = min(p.y for p in pts)
         max_y = max(p.y for p in pts)
-        tol = math.sqrt((max_x - min_x)**2 + (max_y - min_y)**2) * 1e-6
+        tol = math.sqrt((max_x - min_x)**2 + (max_y - min_y)**2) * CLOSE_ENOUGH
     tol2 = tol * tol
 
     merged_nodes = 0
     split_segs = 0
     removed_segs = 0
 
-    # 1. Merge near-duplicate nodes
+    # 1. Merge near-duplicate nodes (x-sorted sweep to avoid O(n²))
     remap = list(range(nv))
-    for i in range(nv):
+    xorder = sorted(range(nv), key=lambda k: pts[k].x)
+    for ii in range(nv):
+        i = xorder[ii]
         if remap[i] != i:
             continue
-        for j in range(i + 1, nv):
+        for jj in range(ii + 1, nv):
+            j = xorder[jj]
+            if pts[j].x - pts[i].x > tol:
+                break  # x-sorted: no more candidates
             if remap[j] != j:
                 continue
             dx = pts[j].x - pts[i].x
@@ -420,10 +442,17 @@ def clean_pslg(mesh, tol, quiet):
             if len2 < tol2:
                 continue
             sqrt_len = math.sqrt(len2)
+            # segment bounding box (expanded by tol)
+            sx0 = min(ax, bx) - tol
+            sx1 = max(ax, bx) + tol
+            sy0 = min(ay, by) - tol
+            sy1 = max(ay, by) + tol
             for i in range(len(pts)):
                 if i == v0 or i == v1:
                     continue
                 if i < nv and remap[i] != i:
+                    continue
+                if pts[i].x < sx0 or pts[i].x > sx1 or pts[i].y < sy0 or pts[i].y > sy1:
                     continue
                 px, py = pts[i].x - ax, pts[i].y - ay
                 t = (dx * px + dy * py) / len2
@@ -433,8 +462,8 @@ def clean_pslg(mesh, tol, quiet):
                 if cross * cross > tol2 * len2:
                     continue
                 # Point i is on segment si — split it
-                s2 = Segment(i, segs[si].v1, segs[si].marker)
-                segs[si] = Segment(segs[si].v0, i, segs[si].marker)
+                s2 = Segment(i, segs[si].v1, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
+                segs[si] = Segment(segs[si].v0, i, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
                 segs.append(s2)
                 split_segs += 1
                 changed = True
@@ -449,12 +478,23 @@ def clean_pslg(mesh, tol, quiet):
                 break
             ax, ay = pts[segs[i].v0].x, pts[segs[i].v0].y
             bx, by = pts[segs[i].v1].x, pts[segs[i].v1].y
+            ax0, ax1 = min(ax, bx), max(ax, bx)
+            ay0, ay1 = min(ay, by), max(ay, by)
             for j in range(i + 1, len(segs)):
                 if changed:
                     break
                 # Skip if they share an endpoint
                 if (segs[i].v0 in (segs[j].v0, segs[j].v1) or
                     segs[i].v1 in (segs[j].v0, segs[j].v1)):
+                    continue
+                # Bounding box pre-filter
+                bx0 = min(pts[segs[j].v0].x, pts[segs[j].v1].x)
+                bx1 = max(pts[segs[j].v0].x, pts[segs[j].v1].x)
+                if ax1 < bx0 or ax0 > bx1:
+                    continue
+                by0 = min(pts[segs[j].v0].y, pts[segs[j].v1].y)
+                by1 = max(pts[segs[j].v0].y, pts[segs[j].v1].y)
+                if ay1 < by0 or ay0 > by1:
                     continue
                 cx, cy = pts[segs[j].v0].x, pts[segs[j].v0].y
                 d2x, d2y = pts[segs[j].v1].x, pts[segs[j].v1].y
@@ -479,11 +519,11 @@ def clean_pslg(mesh, tol, quiet):
                     near_node = len(pts)
                     pts.append(Point(ix, iy, near_node, 0))
                 # Split both segments
-                s_i2 = Segment(near_node, segs[i].v1, segs[i].marker)
-                segs[i] = Segment(segs[i].v0, near_node, segs[i].marker)
+                s_i2 = Segment(near_node, segs[i].v1, segs[i].marker, segs[i].lfs, segs[i].pbc_type, segs[i].no_split)
+                segs[i] = Segment(segs[i].v0, near_node, segs[i].marker, segs[i].lfs, segs[i].pbc_type, segs[i].no_split)
                 segs.append(s_i2)
-                s_j2 = Segment(near_node, segs[j].v1, segs[j].marker)
-                segs[j] = Segment(segs[j].v0, near_node, segs[j].marker)
+                s_j2 = Segment(near_node, segs[j].v1, segs[j].marker, segs[j].lfs, segs[j].pbc_type, segs[j].no_split)
+                segs[j] = Segment(segs[j].v0, near_node, segs[j].marker, segs[j].lfs, segs[j].pbc_type, segs[j].no_split)
                 segs.append(s_j2)
                 split_segs += 2
                 changed = True
@@ -949,9 +989,9 @@ def enforce_constraints(mesh, quiet):
             on_seg.sort()
             prev_v = su
             for _, vi in on_seg:
-                new_segs.append(Segment(prev_v, vi, seg.marker))
+                new_segs.append(Segment(prev_v, vi, seg.marker, seg.lfs, seg.pbc_type, seg.no_split))
                 prev_v = vi
-            new_segs.append(Segment(prev_v, sv, seg.marker))
+            new_segs.append(Segment(prev_v, sv, seg.marker, seg.lfs, seg.pbc_type, seg.no_split))
     if len(new_segs) != len(mesh.segments):
         if not quiet:
             print(f"  Split {len(mesh.segments)} segments into {len(new_segs)} sub-segments (collinear vertices)",
@@ -1814,7 +1854,48 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected):
         mesh.vertices.pop()
         return -1
 
+    # Precise refinement: use exact orient2d_xy to walk from the approximate
+    # triangle to the true containing triangle, à la Triangle's preciselocate().
+    on_edge = -1
+    for _ in range(len(mesh.triangles)):
+        tr = mesh.triangles[ti]
+        if tr.v[0] < 0:
+            mesh.vertices.pop()
+            return -1
+        on_edge = -1
+        neg_edge = -1
+        for j in range(3):
+            o = orient2d_xy(mesh.vertices[tr.v[j]].x, mesh.vertices[tr.v[j]].y,
+                            mesh.vertices[tr.v[(j+1)%3]].x, mesh.vertices[tr.v[(j+1)%3]].y,
+                            np.x, np.y)
+            if o == 0.0:
+                on_edge = j
+            elif o < 0.0:
+                neg_edge = j
+        if neg_edge < 0:
+            break  # all orient2d >= 0: point is inside (or on edge)
+        nb = tr.neighbors[neg_edge]
+        if nb < 0:
+            break  # boundary — accept current triangle
+        ti = nb
+        on_edge = -1
+
     t = mesh.triangles[ti]
+
+    # If precise refinement didn't detect on-edge (midpoint rounding),
+    # fall back to EPS-based on-edge detection for segment midpoints.
+    if on_edge < 0:
+        for j in range(3):
+            va, vb = t.v[j], t.v[(j + 1) % 3]
+            edx = mesh.vertices[vb].x - mesh.vertices[va].x
+            edy = mesh.vertices[vb].y - mesh.vertices[va].y
+            o = orient2d_xy(mesh.vertices[va].x, mesh.vertices[va].y,
+                            mesh.vertices[vb].x, mesh.vertices[vb].y, np.x, np.y)
+            if o * o < EPS * EPS * (edx * edx + edy * edy):
+                on_edge = j
+                break
+
+    # Check near-coincident with existing vertex
     for j in range(3):
         dx = mesh.vertices[t.v[j]].x - np.x
         dy = mesh.vertices[t.v[j]].y - np.y
@@ -1825,18 +1906,6 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected):
     # Inherit region from the containing triangle
     reg_attr = t.region_attrib
     reg_area = t.region_max_area
-
-    # Check if point is on an edge
-    on_edge = -1
-    for j in range(3):
-        va, vb = t.v[j], t.v[(j + 1) % 3]
-        edx = mesh.vertices[vb].x - mesh.vertices[va].x
-        edy = mesh.vertices[vb].y - mesh.vertices[va].y
-        o = orient2d_xy(mesh.vertices[va].x, mesh.vertices[va].y,
-                        mesh.vertices[vb].x, mesh.vertices[vb].y, np.x, np.y)
-        if o * o < EPS * EPS * (edx * edx + edy * edy):
-            on_edge = j
-            break
 
     flip_stack = []
 
@@ -2348,7 +2417,7 @@ def refine_quality(mesh, opts, n_input_verts):
         """Split segment at midpoint. Returns midpoint index or -1 on failure."""
         seg = Segment(mesh.segments[si].v0, mesh.segments[si].v1,
                       mesh.segments[si].marker, mesh.segments[si].lfs,
-                      mesh.segments[si].pbc_partner, mesh.segments[si].pbc_type)
+                      mesh.segments[si].pbc_type, mesh.segments[si].no_split)
         sa, sb = mesh.vertices[seg.v0], mesh.vertices[seg.v1]
         mx, my = (sa.x + sb.x) * 0.5, (sa.y + sb.y) * 0.5
         mid = Point(mx, my, len(mesh.vertices), seg.marker, [], seg.lfs)
@@ -2374,8 +2443,8 @@ def refine_quality(mesh, opts, n_input_verts):
             shell_apex[mid_idx] = a0
         elif a1 >= 0 and a1 in acute_apices:
             shell_apex[mid_idx] = a1
-        s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_partner, seg.pbc_type)
-        s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_partner, seg.pbc_type)
+        s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_type, seg.no_split)
+        s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_type, seg.no_split)
         mesh.segments[si] = s1
         new_si = len(mesh.segments)
         mesh.segments.append(s2)
@@ -2413,6 +2482,9 @@ def refine_quality(mesh, opts, n_input_verts):
                         mesh.pbc_twin[partner_mid] = mid_idx
                         mesh.pbc_node_type[mid_idx] = pbc_type
                         mesh.pbc_node_type[partner_mid] = pbc_type
+                        # Add partner-affected triangles so the caller can
+                        # queue them for quality checking.
+                        out_affected.extend(partner_affected)
         return True
 
     def find_encroached(px, py):
@@ -2428,6 +2500,8 @@ def refine_quality(mesh, opts, n_input_verts):
                     continue
                 for si in seg_grid[key]:
                     s = mesh.segments[si]
+                    if s.no_split:
+                        continue  # AGE chords must stay uniformly spaced
                     sa, sb = mesh.vertices[s.v0], mesh.vertices[s.v1]
                     mx2, my2 = (sa.x + sb.x) * 0.5, (sa.y + sb.y) * 0.5
                     sr2 = ((sb.x-sa.x)*(sb.x-sa.x)+(sb.y-sa.y)*(sb.y-sa.y)) * 0.25
@@ -2495,6 +2569,15 @@ def refine_quality(mesh, opts, n_input_verts):
                     edge_key(va, vc_v) in constrained_edges):
                     dbg_skip += 1
                     continue
+            # For tiny triangles (all edges < bboxDiag * CLOSE_ENOUGH),
+            # accept a reduced minimum angle instead of the full threshold.
+            tiny_len2 = bb_diag * CLOSE_ENOUGH
+            tiny_len2 *= tiny_len2
+            if la2 < tiny_len2 and lb2 < tiny_len2 and lc2 < tiny_len2:
+                ang = min_angle(a, b, c)
+                if ang >= min(min_ang_val, TINY_TRI_ANGLE):
+                    dbg_skip += 1
+                    continue
 
         # Compute circumcenter or off-center
         if ang_viol:
@@ -2539,11 +2622,16 @@ def refine_quality(mesh, opts, n_input_verts):
             seg_aff = []
             if split_segment(enc_seg, seg_aff, bad_idx):
                 dbg_encroach += 1
-                mr = tri_metric(mesh, bad_idx, min_ang_val, global_max_a, use_region_area, cos_min_ang)
-                if mr[0] > 0:
-                    heappush(pq, (-mr[0], bad_idx, mesh.triangles[bad_idx].generation))
+                # Don't explicitly re-queue badIdx: if the segment split
+                # modified it, it will be re-queued via seg_aff below.
+                # Re-queuing unchanged triangles creates infinite loops
+                # when their circumcenter always encroaches the same area.
                 for ti2 in seg_aff:
                     if 0 <= ti2 < len(mesh.triangles) and mesh.triangles[ti2].v[0] >= 0:
+                        mr2 = tri_metric(mesh, ti2, min_ang_val, global_max_a,
+                                         use_region_area, cos_min_ang)
+                        if mr2[0] > 0:
+                            heappush(pq, (-mr2[0], ti2, mesh.triangles[ti2].generation))
                         for k in range(3):
                             nb = mesh.triangles[ti2].neighbors[k]
                             if nb >= 0:
@@ -2955,6 +3043,194 @@ Input: .node or .poly files. Output: .1.node .1.ele [.1.edge] [.1.neigh] [.1.pol
           file=sys.stderr)
 
 
+def build_pbc_twin_from_cdt(mesh):
+    """Build PBC twin map from CDT orientation.
+    After CDT enforcement, orient PBC segments consistently using
+    triangle adjacency (interior on left), then pair nodes in lockstep."""
+    has_pbc = any(s.pbc_type >= 0 for s in mesh.segments)
+    if not has_pbc:
+        return
+
+    mesh.pbc_twin = {}
+    mesh.pbc_node_type = {}
+
+    # Orient each PBC segment to match CDT edge direction.
+    # Find the lowest-indexed triangle containing the edge, and orient
+    # the segment to match that triangle's CCW winding.
+    v2t = [[] for _ in range(len(mesh.vertices))]
+    for i, t in enumerate(mesh.triangles):
+        if t.v[0] < 0:
+            continue
+        for j in range(3):
+            v2t[t.v[j]].append(i)
+
+    for s in mesh.segments:
+        if s.pbc_type < 0:
+            continue
+        best_tri, best_j = len(mesh.triangles), -1
+        for ti in v2t[s.v0]:
+            t = mesh.triangles[ti]
+            if t.v[0] < 0:
+                continue
+            for j in range(3):
+                if ((t.v[j] == s.v0 and t.v[(j+1)%3] == s.v1) or
+                    (t.v[j] == s.v1 and t.v[(j+1)%3] == s.v0)):
+                    if ti < best_tri:
+                        best_tri, best_j = ti, j
+        if best_j >= 0:
+            t = mesh.triangles[best_tri]
+            if t.v[best_j] == s.v1 and t.v[(best_j+1)%3] == s.v0:
+                s.v0, s.v1 = s.v1, s.v0
+
+    # Group PBC segments by boundary {marker, pbc_type}.
+    pbc_boundaries = set()
+    for s in mesh.segments:
+        if s.pbc_type >= 0:
+            pbc_boundaries.add((s.marker, s.pbc_type))
+
+    bdry_pairs = []
+    for marker, pbc_type in pbc_boundaries:
+        all_segs = [si for si, s in enumerate(mesh.segments)
+                    if s.marker == marker and s.pbc_type == pbc_type]
+
+        # BFS split into two connected chains
+        remaining = set(all_segs)
+        def extract_chain():
+            if not remaining:
+                return []
+            chain = []
+            adj = {}
+            for si in remaining:
+                adj.setdefault(mesh.segments[si].v0, []).append(si)
+                adj.setdefault(mesh.segments[si].v1, []).append(si)
+            first = next(iter(remaining))
+            q = [first]
+            remaining.discard(first)
+            chain.append(first)
+            while q:
+                si = q.pop(0)
+                for nd in (mesh.segments[si].v0, mesh.segments[si].v1):
+                    for ni in adj.get(nd, []):
+                        if ni in remaining:
+                            remaining.discard(ni)
+                            chain.append(ni)
+                            q.append(ni)
+            return chain
+
+        sl1 = extract_chain()
+        sl2 = extract_chain()
+        if not sl1 or not sl2:
+            continue
+
+        # Build DIRECTED node chain following CDT segment orientation.
+        def build_directed_chain(seg_indices):
+            if not seg_indices:
+                return []
+            from_v0 = {}
+            degree = {}
+            for si in seg_indices:
+                from_v0.setdefault(mesh.segments[si].v0, []).append(si)
+                degree[mesh.segments[si].v0] = degree.get(mesh.segments[si].v0, 0) + 1
+                degree[mesh.segments[si].v1] = degree.get(mesh.segments[si].v1, 0) + 1
+            # Find chain start: endpoint node (degree 1) that is v0 of some segment
+            start_node = -1
+            for si in seg_indices:
+                v0 = mesh.segments[si].v0
+                if degree.get(v0, 0) == 1:
+                    start_node = v0
+                    break
+            if start_node < 0:
+                for si in seg_indices:
+                    v1 = mesh.segments[si].v1
+                    if degree.get(v1, 0) == 1:
+                        start_node = v1
+                        break
+            if start_node < 0:
+                return []
+            chain = [start_node]
+            visited = set()
+            cur_node = start_node
+            while True:
+                found = False
+                for si in from_v0.get(cur_node, []):
+                    if si in visited:
+                        continue
+                    visited.add(si)
+                    chain.append(mesh.segments[si].v1)
+                    cur_node = mesh.segments[si].v1
+                    found = True
+                    break
+                if not found:
+                    for si in seg_indices:
+                        if si in visited:
+                            continue
+                        if mesh.segments[si].v1 == cur_node:
+                            visited.add(si)
+                            chain.append(mesh.segments[si].v0)
+                            cur_node = mesh.segments[si].v0
+                            found = True
+                            break
+                if not found:
+                    break
+            return chain
+
+        chain1 = build_directed_chain(sl1)
+        chain2 = build_directed_chain(sl2)
+        if not chain1 or not chain2:
+            continue
+        if len(chain1) != len(chain2):
+            continue
+        bdry_pairs.append((chain1, chain2, pbc_type, False))
+
+    # Process boundaries with constraint propagation through shared junction nodes.
+    progress = True
+    while progress:
+        progress = False
+        new_pairs = []
+        for chain1, chain2, pbc_type, processed in bdry_pairs:
+            if processed:
+                new_pairs.append((chain1, chain2, pbc_type, True))
+                continue
+            need_reverse = True  # default: reverse (OF convention)
+            constraint_found = False
+            for ci in range(len(chain1)):
+                if chain1[ci] not in mesh.pbc_twin:
+                    continue
+                twin = mesh.pbc_twin[chain1[ci]]
+                for cj in range(len(chain2)):
+                    if chain2[cj] == twin:
+                        need_reverse = (cj != ci)
+                        constraint_found = True
+                        break
+                if constraint_found:
+                    break
+            if not constraint_found:
+                for ci in range(len(chain2)):
+                    if chain2[ci] not in mesh.pbc_twin:
+                        continue
+                    twin = mesh.pbc_twin[chain2[ci]]
+                    for cj in range(len(chain1)):
+                        if chain1[cj] == twin:
+                            need_reverse = (cj != ci)
+                            constraint_found = True
+                            break
+                    if constraint_found:
+                        break
+            if need_reverse:
+                chain2 = list(reversed(chain2))
+            for i in range(len(chain1)):
+                a, b = chain1[i], chain2[i]
+                if a == b:
+                    continue
+                mesh.pbc_twin[a] = b
+                mesh.pbc_twin[b] = a
+                mesh.pbc_node_type[a] = pbc_type
+                mesh.pbc_node_type[b] = pbc_type
+            new_pairs.append((chain1, chain2, pbc_type, True))
+            progress = True
+        bdry_pairs = new_pairs
+
+
 def main():
     if len(sys.argv) < 2:
         print_usage()
@@ -2997,84 +3273,7 @@ def main():
         mesh.holes = holes
         mesh.regions = regions
 
-        # Build PBC twin map for .poly PBC definitions.
-        # PBC in .poly uses marker pairs: segments with marker_a pair with marker_b.
-        pbc_markers = set()
-        for s in mesh.segments:
-            if s.pbc_type >= 0:
-                pbc_markers.add(s.marker)
-
-        if pbc_markers:
-            def build_chain(seg_indices):
-                if not seg_indices:
-                    return []
-                node_segs = {}
-                for si in seg_indices:
-                    s = mesh.segments[si]
-                    node_segs.setdefault(s.v0, []).append(si)
-                    node_segs.setdefault(s.v1, []).append(si)
-                start_node = -1
-                for node, slist in node_segs.items():
-                    if len(slist) == 1:
-                        start_node = node; break
-                if start_node < 0:
-                    return []
-                chain = [start_node]
-                visited = set()
-                cur_node = start_node
-                while True:
-                    found = False
-                    for si in node_segs[cur_node]:
-                        if si in visited:
-                            continue
-                        visited.add(si)
-                        s = mesh.segments[si]
-                        nxt = s.v1 if s.v0 == cur_node else s.v0
-                        chain.append(nxt); cur_node = nxt; found = True; break
-                    if not found:
-                        break
-                return chain
-
-            # Group PBC markers by pbc_type into pairs
-            type_to_markers = {}
-            for m in pbc_markers:
-                for s in mesh.segments:
-                    if s.marker == m and s.pbc_type >= 0:
-                        type_to_markers.setdefault(s.pbc_type, []).append(m)
-                        break
-
-            for pbc_type, markers in type_to_markers.items():
-                for mi in range(0, len(markers) - 1, 2):
-                    m_a, m_b = markers[mi], markers[mi + 1]
-                    segs_a = [si for si, s in enumerate(mesh.segments)
-                              if s.marker == m_a and s.pbc_type >= 0]
-                    segs_b = [si for si, s in enumerate(mesh.segments)
-                              if s.marker == m_b and s.pbc_type >= 0]
-                    chain_a = build_chain(segs_a)
-                    chain_b = build_chain(segs_b)
-                    if not chain_a or not chain_b:
-                        continue
-                    if len(chain_a) != len(chain_b):
-                        print(f"Warning: PBC markers {m_a} and {m_b} have different "
-                              f"chain lengths ({len(chain_a)} vs {len(chain_b)})",
-                              file=sys.stderr)
-                        continue
-                    # Orient chains consistently
-                    def dist2(a, b):
-                        dx = mesh.vertices[a].x - mesh.vertices[b].x
-                        dy = mesh.vertices[a].y - mesh.vertices[b].y
-                        return dx * dx + dy * dy
-                    d_same = dist2(chain_a[0], chain_b[0]) + dist2(chain_a[-1], chain_b[-1])
-                    d_rev = dist2(chain_a[0], chain_b[-1]) + dist2(chain_a[-1], chain_b[0])
-                    if d_rev < d_same:
-                        chain_b.reverse()
-                    for i in range(len(chain_a)):
-                        a, b = chain_a[i], chain_b[i]
-                        if a == b:
-                            continue
-                        mesh.pbc_twin[a] = b; mesh.pbc_twin[b] = a
-                        mesh.pbc_node_type[a] = pbc_type
-                        mesh.pbc_node_type[b] = pbc_type
+        # PBC node pairing is handled by build_pbc_twin_from_cdt after hole removal.
     else:
         pts, n_attribs, n_markers = read_node_file(input_file)
         mesh.vertices = pts
@@ -3169,8 +3368,9 @@ def main():
                 mid_idx = len(mesh.vertices)
                 mesh.vertices.append(Point(mx, my, mid_idx, bm, []))
                 v0, v1, mk = seg.v0, seg.v1, seg.marker
-                mesh.segments[si] = Segment(v0, mid_idx, mk)
-                mesh.segments.insert(si + 1, Segment(mid_idx, v1, mk))
+                slfs, spt = seg.lfs, seg.pbc_type
+                mesh.segments[si] = Segment(v0, mid_idx, mk, slfs, spt)
+                mesh.segments.insert(si + 1, Segment(mid_idx, v1, mk, slfs, spt))
 
             if not opts.quiet:
                 print(f"  Split {len(to_split)} long unenforced segments, rebuilding...",
@@ -3188,6 +3388,9 @@ def main():
         remove_holes(mesh, opts)
     if not opts.quiet:
         print(f"  Holes: {elapsed():.1f} ms", file=sys.stderr)
+
+    # 3b. Build PBC twin map from CDT orientation.
+    build_pbc_twin_from_cdt(mesh)
 
     # 4. Assign regions
     if opts.regions:
