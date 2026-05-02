@@ -6,7 +6,7 @@
 // Generated with the assistance of Claude Code Opus 4.6
 //
 // Version 0.2
-// 17 Mar 2026
+// 18 Mar 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -61,6 +61,7 @@
 #include <stdexcept>
 #include <limits>
 #include <cstring>
+#include <climits>
 #include "float256.h"
 #include <numeric>
 #include <queue>
@@ -83,6 +84,17 @@ using EdgeSet = std::unordered_set<std::pair<int,int>, PairHash>;
 static const double EPS_SCALE = 1e-10;
 static double EPS = EPS_SCALE;
 
+// Relative tolerance for "too close" geometry: used both by cleanPSLG
+// (merge nodes within bboxDiag * CLOSE_ENOUGH) and by quality refinement
+// (reduce angle threshold for triangles with all edges < bboxDiag * CLOSE_ENOUGH).
+// Matches FEMM's CLOSE_ENOUGH in document.cpp.
+static const double CLOSE_ENOUGH = 1e-6;
+
+// Reduced minimum angle (degrees) for tiny triangles in locally dense
+// regions (e.g. near-coincident input vertices) where the full minimum
+// angle is unachievable, but some refinement is still worthwhile.
+static const double TINY_TRI_ANGLE = 15.0;
+
 struct Options {
     bool pslg          = false;
     bool no_poly_out   = false;
@@ -99,8 +111,10 @@ struct Options {
     bool no_holes      = false;
     bool no_steiner    = false;
     bool neighbors     = false;
+    bool stamp         = false;
     bool clean_pslg    = false;
-    double clean_tol   = -1.0;  // -1 = auto (bboxDiag * 1e-6)
+    double clean_tol   = -1.0;  // -1 = auto (bboxDiag * CLOSE_ENOUGH)
+    bool no_lfs_output = false; // suppress LFS column in .node output (for FEMM solver)
     int  first_index   = 1;
 };
 
@@ -120,8 +134,8 @@ struct Segment {
     int v0, v1;
     int marker;
     double lfs = -1.0;   // per-segment LFS constraint (-1 = none)
-    int pbc_partner = -1; // index of paired PBC segment (-1 = none)
     int pbc_type = -1;    // 0=periodic, 1=anti-periodic (-1 = none)
+    bool no_split = false; // true for AGE chord segments (must stay uniformly spaced)
 };
 
 struct Hole { double x, y; };
@@ -141,12 +155,20 @@ struct Triangle {
     int    generation = 0;
 };
 
-// Lightweight orient2d for triangle walks — no exact fallback needed because
-// the walk is intrinsically robust to occasional sign errors (it self-corrects
-// or falls through to the linear scan).  Also avoids constructing a Point with
-// its heap-allocated attribs vector.
+// orient2d on raw coordinates — avoids constructing a Point with its
+// heap-allocated attribs vector.  Same exact-arithmetic fallback as orient2d.
 inline double orient2d_xy(double ax, double ay, double bx, double by, double cx, double cy){
-    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    double Ax = bx - ax, Ay = by - ay;
+    double Bx = cx - ax, By = cy - ay;
+    double det = Ax * By - Bx * Ay;
+
+    double M = std::max({std::abs(Ax), std::abs(Ay), std::abs(Bx), std::abs(By)});
+    if(std::abs(det) > 6.662e-16 * M * M) return det;
+
+    float128 fAx = float128(bx) - float128(ax), fAy = float128(by) - float128(ay);
+    float128 fBx = float128(cx) - float128(ax), fBy = float128(cy) - float128(ay);
+    float128 fdet = fAx * fBy - fBx * fAy;
+    return fdet.hi;
 }
 
 inline double orient2d(const Point& a, const Point& b, const Point& c){
@@ -252,6 +274,19 @@ struct PBCNodePair {
     int type; // 0=periodic, 1=anti-periodic
 };
 
+struct AGEDef {
+    std::string name;
+    int format;           // 0=periodic, 1=anti-periodic
+    double innerAngle;    // starting angle of inner arc (degrees)
+    double outerAngle;    // starting angle of outer arc (degrees)
+    double ri, ro;        // inner and outer radii
+    double totalArcLength;// angle spanned by the AGE (degrees), after halving
+    double cx, cy;        // center of the air gap arcs
+    int n;                // number of nodes per ring
+    std::vector<int> innerNodes; // ordered by angle
+    std::vector<int> outerNodes; // ordered by angle
+};
+
 struct Mesh {
     std::vector<Point>    vertices;
     std::vector<Triangle> triangles;
@@ -262,6 +297,7 @@ struct Mesh {
     std::vector<PBCNodePair> pbc_pairs; // filled after refinement
     std::map<int,int> pbc_twin;          // node↔twin mapping for PBC boundaries
     std::map<int,int> pbc_node_type;     // node→PBC type (0=periodic, 1=anti-periodic)
+    std::vector<AGEDef> age_defs;        // air gap element definitions
 
     void rebuildAdjacency(){
         int nt=(int)triangles.size();
@@ -365,6 +401,7 @@ void buildDelaunay(Mesh& mesh){
     });
 
     int lastTri = 0;
+
     std::vector<int> visitEpoch;
     int epoch = 0;
 
@@ -399,7 +436,7 @@ void buildDelaunay(Mesh& mesh){
         }
         if(startTri<0) continue;
 
-        // BFS cavity (epoch-based visited to avoid per-point allocation)
+        // BFS cavity
         epoch++;
         visitEpoch.resize(tris.size(), 0);
         std::vector<int> bad;
@@ -758,10 +795,10 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                 std::sort(onSeg.begin(), onSeg.end());
                 int prev=su;
                 for(auto& [t,vi] : onSeg){
-                    newSegs.push_back({prev, vi, seg.marker});
+                    newSegs.push_back({prev, vi, seg.marker, seg.lfs, seg.pbc_type, seg.no_split});
                     prev=vi;
                 }
-                newSegs.push_back({prev, sv, seg.marker});
+                newSegs.push_back({prev, sv, seg.marker, seg.lfs, seg.pbc_type, seg.no_split});
             }
         }
         if(newSegs.size() != mesh.segments.size()){
@@ -1093,6 +1130,7 @@ int enforceConstraints(Mesh& mesh, bool quiet){
             }
         }
     }
+
     {
         // Build set of constraint edges to protect during flipping
         EdgeSet segEdges;
@@ -1246,7 +1284,6 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                         v2t[ea].erase(std::remove(v2t[ea].begin(), v2t[ea].end(), nbTri), v2t[ea].end());
                         v2t[q].push_back(ti);
                         v2t[p].push_back(nbTri);
-
 
                         // If new edge still crosses, re-enqueue
                         if(segsCross(su, sv, p, q))
@@ -1494,7 +1531,7 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                 std::cerr<<"  UNENFORCED: v"<<s.v0<<" ("<<mesh.vertices[s.v0].x<<","<<mesh.vertices[s.v0].y
                          <<")->v"<<s.v1<<" ("<<mesh.vertices[s.v1].x<<","<<mesh.vertices[s.v1].y
                          <<") len="<<std::sqrt((mesh.vertices[s.v1].x-mesh.vertices[s.v0].x)*(mesh.vertices[s.v1].x-mesh.vertices[s.v0].x)+
-                                              (mesh.vertices[s.v1].y-mesh.vertices[s.v0].y)*(mesh.vertices[s.v1].y-mesh.vertices[s.v0].y))<<"\n";
+                                               (mesh.vertices[s.v1].y-mesh.vertices[s.v0].y)*(mesh.vertices[s.v1].y-mesh.vertices[s.v0].y))<<"\n";
         }
     }
     if(!quiet && miss>0)
@@ -1631,7 +1668,42 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
     int ti=mesh.locateTriangle(np.x, np.y, hintTri);
     if(ti<0){ mesh.vertices.pop_back(); return -1; }
 
+    // Precise refinement: use exact orient2d_xy to walk from the approximate
+    // triangle (found by locateTriangle with -EPS tolerance) to the true
+    // containing triangle, à la Triangle's preciselocate().
+    int onEdge=-1;
+    for(int refine=0; refine<(int)mesh.triangles.size(); refine++){
+        auto& tr=mesh.triangles[ti];
+        if(tr.v[0]<0){ mesh.vertices.pop_back(); return -1; }
+        onEdge=-1;
+        int negEdge=-1;
+        for(int j=0;j<3;j++){
+            double o=orient2d_xy(mesh.vertices[tr.v[j]].x,mesh.vertices[tr.v[j]].y,
+                                 mesh.vertices[tr.v[(j+1)%3]].x,mesh.vertices[tr.v[(j+1)%3]].y,
+                                 np.x,np.y);
+            if(o==0.0) onEdge=j;
+            else if(o<0.0) negEdge=j;
+        }
+        if(negEdge<0) break; // all orient2d >= 0: point is inside (or on edge)
+        int nb=tr.neighbors[negEdge];
+        if(nb<0) break; // boundary — accept current triangle
+        ti=nb;
+        onEdge=-1;
+    }
+
+    // If precise refinement didn't detect on-edge (midpoint rounding),
+    // fall back to EPS-based on-edge detection for segment midpoints.
     auto& t=mesh.triangles[ti];
+    if(onEdge<0){
+        for(int j=0;j<3;j++){
+            int va=t.v[j], vb=t.v[(j+1)%3];
+            double edx=mesh.vertices[vb].x-mesh.vertices[va].x, edy=mesh.vertices[vb].y-mesh.vertices[va].y;
+            double o=orient2d_xy(mesh.vertices[va].x,mesh.vertices[va].y,
+                                 mesh.vertices[vb].x,mesh.vertices[vb].y,np.x,np.y);
+            if(o*o < EPS*EPS*(edx*edx+edy*edy)){ onEdge=j; break; }
+        }
+    }
+
     // Check near-coincident with existing vertex
     for(int j=0;j<3;j++){
         double dx=mesh.vertices[t.v[j]].x-np.x, dy=mesh.vertices[t.v[j]].y-np.y;
@@ -1641,16 +1713,6 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
     // Inherit region from the containing triangle
     double reg_attr=t.region_attrib;
     double reg_area=t.region_max_area;
-
-    // Check if point is on an edge of the containing triangle
-    int onEdge=-1;
-    for(int j=0;j<3;j++){
-        int va=t.v[j], vb=t.v[(j+1)%3];
-        double edx=mesh.vertices[vb].x-mesh.vertices[va].x, edy=mesh.vertices[vb].y-mesh.vertices[va].y;
-        double o=orient2d_xy(mesh.vertices[va].x,mesh.vertices[va].y,
-                             mesh.vertices[vb].x,mesh.vertices[vb].y,np.x,np.y);
-        if(o*o < EPS*EPS*(edx*edx+edy*edy)){ onEdge=j; break; }
-    }
 
     std::vector<std::pair<int,int>> flipStackLocal;
     auto& flipStack = flipBuf ? *flipBuf : flipStackLocal;
@@ -1724,6 +1786,7 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
                 n_dvb=tn.neighbors[(je+1)%3]; // across vb->vd... = b->q
                 n_avd=tn.neighbors[(je+2)%3]; // across vd->va... = q->a
             }
+
 
             // Inherit region from the neighbor triangle
             double reg_attr2=tn.region_attrib;
@@ -1843,7 +1906,7 @@ struct TriMetricResult {
     bool areaViol;
     double area;
     double effectiveMaxArea;
-    double la2, lb2, lc2; // squared edge lengths opposite vertices a, b, c
+    double la2, lb2, lc2; // squared edge lengths (cached for reuse)
     double cross;          // 2*signed area = (b-a)x(c-a)
 };
 
@@ -1855,12 +1918,10 @@ TriMetricResult triMetric(const Mesh& mesh, int ti, double minAng, double global
     auto& b=mesh.vertices[t.v[1]];
     auto& c=mesh.vertices[t.v[2]];
 
-    // Squared edge lengths (computed once, reused for both area and angle checks)
     double la2=(b.x-c.x)*(b.x-c.x)+(b.y-c.y)*(b.y-c.y);
     double lb2=(a.x-c.x)*(a.x-c.x)+(a.y-c.y)*(a.y-c.y);
     double lc2=(a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y);
 
-    // Area via cross product (no orient2d exact-arithmetic overhead)
     double cross=(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
     double area=0.5*std::abs(cross);
 
@@ -1870,7 +1931,6 @@ TriMetricResult triMetric(const Mesh& mesh, int ti, double minAng, double global
         if(effectiveMaxArea>0) effectiveMaxArea=std::min(effectiveMaxArea,globalMaxA);
         else effectiveMaxArea=globalMaxA;
     }
-    // LFS constraint: if any vertex has lfs defined, impose area <= sqrt(3)/4 * lfs^2
     for(int j=0;j<3;j++){
         double vl=mesh.vertices[t.v[j]].lfs;
         if(vl>0){
@@ -1882,10 +1942,6 @@ TriMetricResult triMetric(const Mesh& mesh, int ti, double minAng, double global
     }
     bool areaViol=(effectiveMaxArea>0 && area>effectiveMaxArea+EPS);
 
-    // Fast angle check using cosine comparison (no hypot/acos)
-    // Minimum angle < threshold iff maximum cosine > cosMinAng.
-    // cos(angle_opposite_la) = (lb²+lc²-la²) / (2·sqrt(lb²·lc²))
-    // Compare squared: (lb²+lc²-la²)² > cos²Threshold · 4·lb²·lc²
     bool angViol=false;
     double maxCosRatio=0; // tracks worst angle violation for metric
     if(minAng>0 && cosMinAng>-0.5){
@@ -1948,7 +2004,7 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             ymin=std::min(ymin,mesh.vertices[vi].y);
             ymax=std::max(ymax,mesh.vertices[vi].y);
         }
-        bbDiag=std::sqrt((xmax-xmin)*(xmax-xmin)+(ymax-ymin)*(ymax-ymin));
+        bbDiag=std::sqrt((xmax-xmin)*(xmax-xmin) + (ymax-ymin)*(ymax-ymin));
     }
 
     // Compute local feature size (LFS) at each vertex as min circumradius
@@ -2127,6 +2183,10 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     }
     int steinerCount=0;
 
+    // Shell tracking for acute-angle wedges (populated before refinement loop)
+    std::unordered_set<int> acuteApices;
+    std::vector<int> shellApex(mesh.vertices.size(), -1);
+
     EdgeSet constrainedEdges;
     for(auto& s:mesh.segments) constrainedEdges.insert(edgeKey(s.v0,s.v1));
     double gxmin=1e30,gxmax=-1e30,gymin=1e30,gymax=-1e30;
@@ -2180,10 +2240,6 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     for(int si=0;si<(int)mesh.segments.size();si++)
         edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
 
-    // Shell tracking for acute-angle wedges (populated before refinement loop)
-    std::unordered_set<int> acuteApices;
-    std::vector<int> shellApex(mesh.vertices.size(), -1);
-
     // Core segment split helper (no PBC synchronization)
     auto splitSegmentCore=[&](int si, std::vector<int>& outAffected, int hintTri=-1) -> int {
         auto seg=mesh.segments[si]; // copy before modifying
@@ -2214,8 +2270,8 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             if(a0>=0 && acuteApices.count(a0)) shellApex[midIdx]=a0;
             else if(a1>=0 && acuteApices.count(a1)) shellApex[midIdx]=a1;
         }
-        Segment s1{seg.v0,midIdx,seg.marker,seg.lfs,seg.pbc_partner,seg.pbc_type};
-        Segment s2{midIdx,seg.v1,seg.marker,seg.lfs,seg.pbc_partner,seg.pbc_type};
+        Segment s1{seg.v0,midIdx,seg.marker,seg.lfs,seg.pbc_type,seg.no_split};
+        Segment s2{midIdx,seg.v1,seg.marker,seg.lfs,seg.pbc_type,seg.no_split};
         mesh.segments[si]=s1;
         int newSi=(int)mesh.segments.size();
         mesh.segments.push_back(s2);
@@ -2256,9 +2312,11 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
                         mesh.pbc_twin[partnerMid]=midIdx;
                         mesh.pbc_node_type[midIdx]=seg.pbc_type;
                         mesh.pbc_node_type[partnerMid]=seg.pbc_type;
-                        // DO NOT add partnerAffected triangles to the quality PQ.
-                        // This breaks the encroachment cascade. Any bad triangles
-                        // near the partner will be caught in subsequent iterations.
+                        // Add partner-affected triangles so the caller can
+                        // queue them for quality checking.
+                        outAffected.insert(outAffected.end(),
+                                           partnerAffected.begin(),
+                                           partnerAffected.end());
                     }
                 }
             }
@@ -2278,6 +2336,7 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             if(it==segGrid.end()) continue;
             for(int si:it->second){
                 auto& s=mesh.segments[si];
+                if(s.no_split) continue; // AGE chords must stay uniformly spaced
                 auto& sa=mesh.vertices[s.v0]; auto& sb=mesh.vertices[s.v1];
                 double mx2=(sa.x+sb.x)*0.5, my2=(sa.y+sb.y)*0.5;
                 double sr2=((sb.x-sa.x)*(sb.x-sa.x)+(sb.y-sa.y)*(sb.y-sa.y))*0.25;
@@ -2313,6 +2372,13 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         }
     }
 
+    // Precompute off-center constant (loop-invariant)
+    const double offconst=minAng>0 ? 0.475*std::sqrt((1.0+std::cos(minAng*M_PI/180.0))/(1.0-std::cos(minAng*M_PI/180.0))) : 0;
+
+    // Pre-allocated buffers reused across iterations
+    std::vector<int> affected, toCheck, segAff;
+    std::vector<std::pair<int,int>> flipBuf;
+
     using PQItem = std::tuple<double, int, int>; // metric, triIdx, generation
     std::priority_queue<PQItem> pq;
 
@@ -2320,13 +2386,6 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         auto mr = triMetric(mesh, i, minAng, globalMaxA, useRegionArea, cosMinAng);
         if(mr.metric > 0) pq.push({mr.metric, i, mesh.triangles[i].generation});
     }
-
-    // Precompute off-center constant (loop-invariant)
-    const double offconst=minAng>0 ? 0.475*std::sqrt((1.0+std::cos(minAng*M_PI/180.0))/(1.0-std::cos(minAng*M_PI/180.0))) : 0;
-
-    // Pre-allocated buffers reused across iterations
-    std::vector<int> affected, toCheck, segAff;
-    std::vector<std::pair<int,int>> flipBuf;
 
     int dbgEncroach=0, dbgInsert=0, dbgSkip=0, dbgFail=0;
     while(!pq.empty() && steinerCount<maxSteiner){
@@ -2370,6 +2429,18 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             if(va<(int)shellApex.size() && shellApex[va]>=0){
                 if(constrainedEdges.count(edgeKey(va,vb)) || constrainedEdges.count(edgeKey(va,vc))){
                     dbgSkip++; continue;
+                }
+            }
+            // For tiny triangles (all edges < bboxDiag * CLOSE_ENOUGH),
+            // accept a reduced minimum angle instead of the full threshold.
+            // These are in locally dense regions (e.g. near-coincident input
+            // vertices) where the full angle is unachievable.
+            {
+                double tinyLen2 = bbDiag * CLOSE_ENOUGH;
+                tinyLen2 *= tinyLen2;
+                if(la2 < tinyLen2 && lb2 < tinyLen2 && lc2 < tinyLen2){
+                    double ang=minAngle(a,b,c);
+                    if(ang >= std::min(minAng, TINY_TRI_ANGLE)){ dbgSkip++; continue; }
                 }
             }
         }
@@ -2429,14 +2500,19 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             segAff.clear();
             if(splitSegment(encSeg, segAff, badIdx)){
                 dbgEncroach++;
-                {auto mr=triMetric(mesh,badIdx,minAng,globalMaxA,useRegionArea,cosMinAng);
-                if(mr.metric>0) pq.push({mr.metric,badIdx,mesh.triangles[badIdx].generation});}
+                // Don't explicitly re-queue badIdx: if the segment split
+                // modified it, it will be re-queued via segAff below.
+                // Re-queuing unchanged triangles creates infinite loops
+                // when their circumcenter always encroaches the same area.
                 for(int ti2:segAff){
-                    if(ti2>=0&&ti2<(int)mesh.triangles.size()&&mesh.triangles[ti2].v[0]>=0)
+                    if(ti2>=0&&ti2<(int)mesh.triangles.size()&&mesh.triangles[ti2].v[0]>=0){
+                        {auto mr2=triMetric(mesh,ti2,minAng,globalMaxA,useRegionArea,cosMinAng);
+                        if(mr2.metric>0) pq.push({mr2.metric,ti2,mesh.triangles[ti2].generation});}
                         for(int k=0;k<3;k++){
                             int nb=mesh.triangles[ti2].neighbors[k];
                             if(nb>=0){ auto mr2=triMetric(mesh,nb,minAng,globalMaxA,useRegionArea,cosMinAng); if(mr2.metric>0) pq.push({mr2.metric,nb,mesh.triangles[nb].generation}); }
                         }
+                    }
                 }
             }
             continue;
@@ -2452,7 +2528,6 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         dbgInsert++;
 
         // Re-check affected triangles and their neighbors
-        // Use a flat sorted vector instead of unordered_set to avoid heap overhead
         toCheck.assign(affected.begin(), affected.end());
         for(int ti : affected){
             if(ti>=0 && ti<(int)mesh.triangles.size() && mesh.triangles[ti].v[0]>=0){
@@ -2475,6 +2550,247 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
                  <<dbgEncroach<<" segment splits, "<<dbgSkip<<" skipped, "
                  <<dbgFail<<" failed insertions\n";
 
+}
+
+// ============================================================
+// Build PBC twin map from CDT orientation
+// ============================================================
+// After CDT enforcement, orient PBC segments consistently using
+// triangle adjacency (interior on left), then pair nodes in lockstep.
+// This matches OF's approach of determining segment direction from
+// the mesh rather than guessing from endpoint distances.
+
+void buildPbcTwinFromCDT(Mesh& mesh){
+    bool hasPbc=false;
+    for(auto& s:mesh.segments) if(s.pbc_type>=0){ hasPbc=true; break; }
+    if(!hasPbc) return;
+
+    mesh.pbc_twin.clear();
+    mesh.pbc_node_type.clear();
+
+    // Orient each PBC segment to match CDT edge direction, replicating OF's
+    // approach (writepoly.cpp lines 755-765). OF reads Triangle's .edge output
+    // and flips segments to match. Triangle outputs each edge from the CCW
+    // perspective of the lowest-indexed triangle containing it.
+    //
+    // We do the same: for each PBC segment, find the lowest-indexed triangle
+    // containing the edge, and orient the segment to match that triangle's
+    // CCW winding. This is deterministic and consistent across all segments.
+    //
+    // Build v2t adjacency for the orientation lookup.
+    std::vector<std::vector<int>> v2t(mesh.vertices.size());
+    for(int i=0;i<(int)mesh.triangles.size();i++){
+        auto& t=mesh.triangles[i]; if(t.v[0]<0) continue;
+        for(int j=0;j<3;j++) v2t[t.v[j]].push_back(i);
+    }
+    for(auto& s:mesh.segments){
+        if(s.pbc_type<0) continue;
+        int bestTri=INT_MAX, bestJ=-1;
+        for(int ti:v2t[s.v0]){
+            auto& t=mesh.triangles[ti]; if(t.v[0]<0) continue;
+            for(int j=0;j<3;j++){
+                if((t.v[j]==s.v0 && t.v[(j+1)%3]==s.v1) ||
+                   (t.v[j]==s.v1 && t.v[(j+1)%3]==s.v0)){
+                    if(ti<bestTri){ bestTri=ti; bestJ=j; }
+                }
+            }
+        }
+        if(bestJ>=0){
+            auto& t=mesh.triangles[bestTri];
+            if(t.v[bestJ]==s.v1 && t.v[(bestJ+1)%3]==s.v0)
+                std::swap(s.v0, s.v1);
+        }
+    }
+
+    // Group PBC segments by boundary {marker, pbc_type}.
+    // BFS-split each group into two chains, build DIRECTED node chains
+    // that follow the CDT-determined segment orientation, then reverse
+    // chain2 unconditionally (OF writepoly.cpp line 1109-1111).
+    std::set<std::pair<int,int>> pbcBoundaries;
+    for(auto& s:mesh.segments)
+        if(s.pbc_type>=0) pbcBoundaries.insert({s.marker, s.pbc_type});
+
+    // Collect all boundary chain pairs first, then process with
+    // constraint propagation through shared junction nodes.
+    struct BdryPair {
+        std::vector<int> chain1, chain2;
+        int pbcType;
+        bool processed=false;
+    };
+    std::vector<BdryPair> bdryPairs;
+
+    for(auto [marker, pbcType]:pbcBoundaries){
+        std::vector<int> allSegs;
+        for(int si=0;si<(int)mesh.segments.size();si++)
+            if(mesh.segments[si].marker==marker && mesh.segments[si].pbc_type==pbcType)
+                allSegs.push_back(si);
+
+        // BFS split into two connected chains
+        std::set<int> remaining(allSegs.begin(), allSegs.end());
+        auto extractChain=[&]() -> std::vector<int> {
+            if(remaining.empty()) return {};
+            std::vector<int> chain;
+            std::map<int,std::vector<int>> adj;
+            for(int si:remaining){
+                adj[mesh.segments[si].v0].push_back(si);
+                adj[mesh.segments[si].v1].push_back(si);
+            }
+            std::queue<int> q;
+            int first=*remaining.begin();
+            q.push(first); remaining.erase(first); chain.push_back(first);
+            while(!q.empty()){
+                int si=q.front(); q.pop();
+                for(int nd:{mesh.segments[si].v0, mesh.segments[si].v1})
+                    for(int ni:adj[nd])
+                        if(remaining.count(ni)){
+                            remaining.erase(ni); chain.push_back(ni); q.push(ni);
+                        }
+            }
+            return chain;
+        };
+        auto sl1=extractChain(), sl2=extractChain();
+        if(sl1.empty()||sl2.empty()) continue;
+
+        // Build DIRECTED node chain following CDT segment orientation.
+        // This is the key difference from the old code: instead of walking
+        // by connectivity (which ignores orientation), we follow v0→v1
+        // direction of each oriented segment, like OF does after reading
+        // Triangle's .edge output.
+        auto buildDirectedChain=[&](const std::vector<int>& segIndices) -> std::vector<int> {
+            if(segIndices.empty()) return {};
+            // Build adjacency: for each node, which segments have it as v0 or v1
+            std::map<int,std::vector<int>> fromV0; // node → segments starting here
+            std::map<int,int> degree;
+            for(int si:segIndices){
+                fromV0[mesh.segments[si].v0].push_back(si);
+                degree[mesh.segments[si].v0]++;
+                degree[mesh.segments[si].v1]++;
+            }
+            // Find chain start: endpoint node (degree 1) that is v0 of some segment
+            int startNode=-1;
+            for(int si:segIndices){
+                int v0=mesh.segments[si].v0;
+                if(degree[v0]==1){ startNode=v0; break; }
+            }
+            // If no oriented start found, try the other endpoint
+            if(startNode<0){
+                for(int si:segIndices){
+                    int v1=mesh.segments[si].v1;
+                    if(degree[v1]==1){ startNode=v1; break; }
+                }
+            }
+            if(startNode<0) return {};
+            // Walk the chain following oriented direction
+            std::vector<int> chain; chain.push_back(startNode);
+            std::set<int> visited;
+            int curNode=startNode;
+            while(true){
+                bool found=false;
+                // Try following oriented direction: curNode is v0 of some segment
+                for(int si:fromV0[curNode]){
+                    if(visited.count(si)) continue;
+                    visited.insert(si);
+                    chain.push_back(mesh.segments[si].v1);
+                    curNode=mesh.segments[si].v1;
+                    found=true; break;
+                }
+                if(!found){
+                    // Try reverse: curNode is v1 of some segment
+                    for(int si:segIndices){
+                        if(visited.count(si)) continue;
+                        if(mesh.segments[si].v1==curNode){
+                            visited.insert(si);
+                            chain.push_back(mesh.segments[si].v0);
+                            curNode=mesh.segments[si].v0;
+                            found=true; break;
+                        }
+                    }
+                }
+                if(!found) break;
+            }
+            return chain;
+        };
+        auto chain1=buildDirectedChain(sl1), chain2=buildDirectedChain(sl2);
+        if(chain1.empty()||chain2.empty()) continue;
+        if(chain1.size()!=chain2.size()) continue;
+
+        bdryPairs.push_back({chain1, chain2, pbcType});
+    }
+
+    // Process boundaries using constraint propagation through shared
+    // junction nodes. When multiple PBC boundaries share endpoint nodes
+    // (e.g. a motor wedge with 4 anti-periodic boundaries along two
+    // radial edges), the twin assigned to a shared node by one boundary
+    // constrains the orientation of adjacent boundaries.
+    //
+    // For each boundary, check if any endpoint node already has a twin
+    // from a previously processed boundary. If so, find that twin in
+    // the other chain to determine whether reversal is needed.
+    //
+    // For the seed boundary (no prior constraints), reverse chain2
+    // unconditionally (OF writepoly.cpp line 1109-1111).
+    bool progress=true;
+    while(progress){
+        progress=false;
+        for(auto& bp:bdryPairs){
+            if(bp.processed) continue;
+            auto& c1=bp.chain1;
+            auto& c2=bp.chain2;
+
+            bool needReverse=true; // default: reverse (OF convention)
+            bool constraintFound=false;
+
+            // Check if any node in c1 has a twin that appears in c2
+            for(int ci=0;ci<(int)c1.size()&&!constraintFound;ci++){
+                if(!mesh.pbc_twin.count(c1[ci])) continue;
+                int twin=mesh.pbc_twin[c1[ci]];
+                for(int cj=0;cj<(int)c2.size();cj++){
+                    if(c2[cj]==twin){
+                        needReverse=(cj!=ci);
+                        constraintFound=true;
+                        break;
+                    }
+                }
+            }
+            // Check if any node in c2 has a twin that appears in c1
+            if(!constraintFound){
+                for(int ci=0;ci<(int)c2.size()&&!constraintFound;ci++){
+                    if(!mesh.pbc_twin.count(c2[ci])) continue;
+                    int twin=mesh.pbc_twin[c2[ci]];
+                    for(int cj=0;cj<(int)c1.size();cj++){
+                        if(c1[cj]==twin){
+                            needReverse=(cj!=ci);
+                            constraintFound=true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if(!constraintFound){
+                // Seed boundary: reverse chain2 unconditionally.
+                // After removeHoles, each PBC segment has exactly one
+                // adjacent triangle (the interior one), so all segments
+                // are oriented with interior on the left. Two PBC
+                // segments bounding the same region from opposite sides
+                // point in opposite directions; reversing one makes
+                // corresponding nodes align (OF writepoly.cpp line 1109).
+                needReverse=true;
+            }
+
+            if(needReverse) std::reverse(c2.begin(), c2.end());
+
+            for(int i=0;i<(int)c1.size();i++){
+                int a=c1[i], b=c2[i];
+                if(a==b) continue;
+                mesh.pbc_twin[a]=b; mesh.pbc_twin[b]=a;
+                mesh.pbc_node_type[a]=bp.pbcType;
+                mesh.pbc_node_type[b]=bp.pbcType;
+            }
+            bp.processed=true;
+            progress=true;
+        }
+    }
 }
 
 // ============================================================
@@ -2627,10 +2943,10 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
                 }
                 if(maxSegAngle>10.0||maxSegAngle<=0.01) maxSegAngle=10.0;
 
-                // Discretize arc into chord segments
+                // Discretize arc into chord segments (same algorithm as readFemFile)
                 double ax=pts[v0].x, ay=pts[v0].y;
                 double bx=pts[v1].x, by=pts[v1].y;
-                double d=std::sqrt((bx-ax)*(bx-ax)+(by-ay)*(by-ay));
+                double d=std::sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
                 if(d<1e-30){ segs.push_back({v0, v1, marker, arcLfs}); continue; }
 
                 double tta=angle*M_PI/180.0;
@@ -2691,14 +3007,685 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
     return true;
 }
 
+// ============================================================
+// FEMM file reader (.fem, .fee, .feh, .fec)
+// ============================================================
 
+// Case-insensitive prefix match
+static bool iPrefix(const std::string& s, const char* prefix){
+    size_t n=std::strlen(prefix);
+    if(s.size()<n) return false;
+    for(size_t i=0;i<n;i++)
+        if(std::tolower((unsigned char)s[i])!=std::tolower((unsigned char)prefix[i])) return false;
+    return true;
+}
+
+// Extract value after '=' in a "[Key] = Value" line
+static std::string stripKey(const std::string& line){
+    auto eq=line.find('=');
+    if(eq==std::string::npos) return "";
+    return line.substr(eq+1);
+}
+
+bool readFemFile(const std::string& filename,
+                 std::vector<Point>& pts,
+                 std::vector<Segment>& segs,
+                 std::vector<Hole>& holes,
+                 std::vector<Region>& regions,
+                 Options& opts,
+                 std::vector<AGEDef>& ageDefs)
+{
+    std::ifstream f(filename);
+    if(!f){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
+
+    // Detect file type from extension
+    bool hasConductors = false;  // .fee, .feh, .fec have conductor columns
+    bool isMagnetics = true;     // .fem uses different BdryFormat numbering
+    { auto dot = filename.rfind('.');
+      if(dot!=std::string::npos){
+          std::string ext=filename.substr(dot);
+          if(ext==".fee"||ext==".feh"||ext==".fec") { hasConductors=true; isMagnetics=false; }
+      }
+    }
+    // BdryFormat for periodic/anti-periodic differs by physics type:
+    //   Magnetics (.fem): 4=periodic, 5=anti-periodic, 6=periodic AGE, 7=anti-periodic AGE
+    //   Others (.fee/.feh/.fec): 3=periodic, 4=anti-periodic (no AGE)
+    int FMT_PERIODIC      = isMagnetics ? 4 : 3;
+    int FMT_ANTIPERIODIC  = isMagnetics ? 5 : 4;
+    int FMT_PERIODIC_AGE  = isMagnetics ? 6 : -1;
+    int FMT_ANTIPERIOD_AGE= isMagnetics ? 7 : -1;
+
+    // FEMM constants
+    const double LINEFRACTION     = 100.0;
+    const double BBOXFRACTION     = 100.0;
+    const double MINANGLE_MAX_VAL = 33.8;
+
+    double minAngle=20.0;
+    int doSmartMesh=0;
+    int nBdryProps=0;
+    double extRo=0, extRi=0;
+    std::vector<int> extRegionIndices;
+
+    // Boundary property storage (BdryFormat: 4=periodic, 5=anti-periodic, 6=periodic AGE, 7=anti-periodic AGE)
+    struct BdryProp { std::string name; int format; double innerAngle=0, outerAngle=0; };
+    std::vector<BdryProp> bdryProps;
+
+    // Temporary storage for arc segments
+    struct FemArc { int n0,n1; double arcLength,maxSideLength; int marker; };
+    struct FemSeg { int n0,n1; double maxSideLength; int marker; };
+    std::vector<FemArc> arcs;
+    std::vector<FemSeg> femSegs;
+
+    std::string line;
+    while(std::getline(f,line)){
+        // Strip leading whitespace
+        size_t p0=line.find_first_not_of(" \t\r\n");
+        if(p0==std::string::npos) continue;
+        std::string trimmed=line.substr(p0);
+
+        // Header fields
+        if(iPrefix(trimmed,"[format]")) continue;
+        if(iPrefix(trimmed,"[frequency]")) continue;
+        if(iPrefix(trimmed,"[precision]")) continue;
+        if(iPrefix(trimmed,"[depth]")) continue;
+        if(iPrefix(trimmed,"[lengthunits]")) continue;
+        if(iPrefix(trimmed,"[problemtype]")) continue;
+        if(iPrefix(trimmed,"[coordinates]")) continue;
+        if(iPrefix(trimmed,"[acsolver]")) continue;
+        if(iPrefix(trimmed,"[prevtype]")) continue;
+        if(iPrefix(trimmed,"[prevsoln]")) continue;
+        if(iPrefix(trimmed,"[comment]")) continue;
+        if(iPrefix(trimmed,"[extzo]")) continue;
+        if(iPrefix(trimmed,"[extro]")){
+            std::istringstream ss(stripKey(trimmed)); ss>>extRo; continue;
+        }
+        if(iPrefix(trimmed,"[extri]")){
+            std::istringstream ss(stripKey(trimmed)); ss>>extRi; continue;
+        }
+
+        if(iPrefix(trimmed,"[minangle]")){
+            std::istringstream ss(stripKey(trimmed));
+            ss>>minAngle;
+            continue;
+        }
+        if(iPrefix(trimmed,"[dosmartmesh]")){
+            std::istringstream ss(stripKey(trimmed));
+            ss>>doSmartMesh;
+            continue;
+        }
+
+        // Parse boundary properties (extract BdryName and BdryType for PBC identification)
+        if(iPrefix(trimmed,"[bdryprops]")){
+            std::istringstream ss(stripKey(trimmed));
+            ss>>nBdryProps;
+            bdryProps.resize(nBdryProps);
+            int seen=0;
+            while(seen<nBdryProps && std::getline(f,line)){
+                // Extract BdryName
+                if(line.find("<BdryName>")!=std::string::npos ||
+                   line.find("<bdryname>")!=std::string::npos){
+                    auto eq=line.find('=');
+                    if(eq!=std::string::npos){
+                        std::string val=line.substr(eq+1);
+                        // Strip whitespace and quotes
+                        size_t s0=val.find_first_not_of(" \t\r\n\"");
+                        size_t s1=val.find_last_not_of(" \t\r\n\"");
+                        if(s0!=std::string::npos && s1!=std::string::npos)
+                            bdryProps[seen].name=val.substr(s0,s1-s0+1);
+                    }
+                }
+                // Extract BdryType (= BdryFormat)
+                if(line.find("<BdryType>")!=std::string::npos ||
+                   line.find("<bdrytype>")!=std::string::npos){
+                    auto eq=line.find('=');
+                    if(eq!=std::string::npos){
+                        std::istringstream vs(line.substr(eq+1));
+                        vs>>bdryProps[seen].format;
+                    }
+                }
+                // Extract innerangle / outerangle for AGE boundaries
+                if(line.find("<innerangle>")!=std::string::npos ||
+                   line.find("<InnerAngle>")!=std::string::npos){
+                    auto eq=line.find('=');
+                    if(eq!=std::string::npos){
+                        std::istringstream vs(line.substr(eq+1));
+                        vs>>bdryProps[seen].innerAngle;
+                    }
+                }
+                if(line.find("<outerangle>")!=std::string::npos ||
+                   line.find("<OuterAngle>")!=std::string::npos){
+                    auto eq=line.find('=');
+                    if(eq!=std::string::npos){
+                        std::istringstream vs(line.substr(eq+1));
+                        vs>>bdryProps[seen].outerAngle;
+                    }
+                }
+                if(line.find("<EndBdry>")!=std::string::npos ||
+                   line.find("<endbdry>")!=std::string::npos) seen++;
+            }
+            continue;
+        }
+
+        // Skip PointProps blocks
+        if(iPrefix(trimmed,"[pointprops]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            int seen=0;
+            while(seen<n && std::getline(f,line)){
+                if(line.find("<EndPoint>")!=std::string::npos ||
+                   line.find("<endpoint>")!=std::string::npos) seen++;
+            }
+            continue;
+        }
+
+        // Skip BlockProps blocks
+        if(iPrefix(trimmed,"[blockprops]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            int seen=0;
+            while(seen<n && std::getline(f,line)){
+                if(line.find("<EndBlock>")!=std::string::npos ||
+                   line.find("<endblock>")!=std::string::npos) seen++;
+            }
+            continue;
+        }
+
+        // Skip CircuitProps blocks
+        if(iPrefix(trimmed,"[circuitprops]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            int seen=0;
+            while(seen<n && std::getline(f,line)){
+                if(line.find("<EndCircuit>")!=std::string::npos ||
+                   line.find("<endcircuit>")!=std::string::npos) seen++;
+            }
+            continue;
+        }
+
+        // Skip ConductorProps blocks (for .fee/.feh/.fec files)
+        if(iPrefix(trimmed,"[conductorprops]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            int seen=0;
+            while(seen<n && std::getline(f,line)){
+                if(line.find("<EndConductor>")!=std::string::npos ||
+                   line.find("<endconductor>")!=std::string::npos) seen++;
+            }
+            continue;
+        }
+
+        // Read points
+        if(iPrefix(trimmed,"[numpoints]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            pts.resize(n);
+            for(int i=0;i<n;i++){
+                if(!std::getline(f,line)) break;
+                std::istringstream ls(line);
+                int bmark=0, group=0, conductor=0;
+                double ptLfs=-1.0;
+                ls>>pts[i].x>>pts[i].y>>bmark>>group;
+                if(hasConductors){
+                    ls>>conductor;  // 1-based conductor index
+                    ls>>ptLfs;      // optional 6th column: local feature size
+                }
+                else
+                    ls>>ptLfs;      // local feature size (.fem only)
+                pts[i].id=i;
+                // Pack bc and conductor into marker:
+                // lower 16 bits = bc+2, upper 16 bits = conductor (1-based from file)
+                pts[i].marker = (bmark>0 || conductor>0)
+                    ? ((conductor<<16) | (bmark>0 ? bmark+1 : 0))
+                    : 0;
+                if(ptLfs>0) pts[i].lfs=ptLfs;
+            }
+            continue;
+        }
+
+        // Read segments
+        if(iPrefix(trimmed,"[numsegments]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            femSegs.resize(n);
+            for(int i=0;i<n;i++){
+                if(!std::getline(f,line)) break;
+                std::istringstream ls(line);
+                int bmark=0, hidden=0, group=0, conductor=0;
+                femSegs[i].maxSideLength=0;
+                ls>>femSegs[i].n0>>femSegs[i].n1>>femSegs[i].maxSideLength>>bmark>>hidden>>group;
+                if(hasConductors) ls>>conductor;
+                if(bmark>0 || conductor>0)
+                    femSegs[i].marker = -(int)((conductor<<16) | (bmark>0 ? bmark+1 : 0));
+                else
+                    femSegs[i].marker = 0;
+            }
+            continue;
+        }
+
+        // Read arc segments
+        if(iPrefix(trimmed,"[numarcsegments]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            arcs.resize(n);
+            for(int i=0;i<n;i++){
+                if(!std::getline(f,line)) break;
+                std::istringstream ls(line);
+                int bmark=0, hidden=0, group=0, conductor=0;
+                double mySideLen=0;
+                ls>>arcs[i].n0>>arcs[i].n1>>arcs[i].arcLength>>arcs[i].maxSideLength
+                  >>bmark>>hidden>>group;
+                if(hasConductors) ls>>conductor;
+                ls>>mySideLen;
+                if(bmark>0 || conductor>0)
+                    arcs[i].marker = -(int)((conductor<<16) | (bmark>0 ? bmark+1 : 0));
+                else
+                    arcs[i].marker = 0;
+            }
+            continue;
+        }
+
+        // Read holes
+        if(iPrefix(trimmed,"[numholes]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            for(int i=0;i<n;i++){
+                if(!std::getline(f,line)) break;
+                std::istringstream ls(line);
+                Hole h;
+                ls>>h.x>>h.y;
+                holes.push_back(h);
+            }
+            continue;
+        }
+
+        // Read block labels -> regions (skip <No Mesh> blocks, which become holes)
+        // blockType in .fem is 1-based material index; 0 = <No Mesh>.
+        // Region attributes use k+1 numbering that skips <No Mesh> blocks,
+        // matching writepoly.cpp so the solver indexes labellist[] correctly.
+        if(iPrefix(trimmed,"[numblocklabels]")){
+            std::istringstream ss(stripKey(trimmed));
+            int n; ss>>n;
+            int k=0; // counter for non-<No Mesh> blocks
+            for(int i=0;i<n;i++){
+                if(!std::getline(f,line)) break;
+                std::istringstream ls(line);
+                double x,y,diam=-1,magDir=0;
+                int blockType=0,circIdx=0,group=0,turns=1,isExt=0;
+                ls>>x>>y>>blockType>>diam>>circIdx>>magDir>>group>>turns>>isExt;
+                if(blockType==0){
+                    // <No Mesh> block → add as hole seed point
+                    holes.push_back({x,y});
+                    continue;
+                }
+                Region r;
+                r.x=x; r.y=y;
+                r.attrib=(double)(k+1); // k+1 encoding, skipping <No Mesh> blocks
+                if(diam>0) r.max_area = M_PI*diam*diam/4.0;
+                else r.max_area = -1.0;
+                regions.push_back(r);
+                if(isExt) extRegionIndices.push_back((int)regions.size()-1);
+                k++;
+            }
+            continue;
+        }
+    }
+
+    // ----- Assign LFS constraints to nodes -----
+
+    // SmartMesh: compute dL and apply to segment endpoints only.
+    // Arcs that meet corners share endpoints with segments, so those
+    // get refined. Arc-only endpoints (e.g. rotor surface) are left alone.
+    if(doSmartMesh && !femSegs.empty()){
+        double totalLen=0;
+        for(auto& s:femSegs){
+            double dx=pts[s.n0].x-pts[s.n1].x, dy=pts[s.n0].y-pts[s.n1].y;
+            totalLen+=std::sqrt(dx*dx+dy*dy);
+        }
+        double dL = (totalLen / (double)femSegs.size()) / LINEFRACTION;
+        auto setLfs=[](Point& p, double v){
+            p.lfs = (p.lfs>0) ? std::min(p.lfs, v) : v;
+        };
+        for(auto& s:femSegs){
+            setLfs(pts[s.n0], dL);
+            setLfs(pts[s.n1], dL);
+        }
+    }
+
+    // Per-segment MaxSideLength: set LFS on segment endpoints
+    for(auto& fs:femSegs){
+        if(fs.maxSideLength>0){
+            auto setLfs=[](Point& p, double v){
+                p.lfs = (p.lfs>0) ? std::min(p.lfs, v) : v;
+            };
+            setLfs(pts[fs.n0], fs.maxSideLength);
+            setLfs(pts[fs.n1], fs.maxSideLength);
+        }
+    }
+
+    // ----- Process line segments (no pre-splitting; LFS handles mesh size) -----
+    // Track output segment ranges per .fem entity for PBC pairing
+    // femSegRange[i] = {first_output_seg, count} for .fem segment i
+    // femArcRange[i] = {first_output_seg, count} for .fem arc i
+    std::vector<std::pair<int,int>> femSegRange(femSegs.size());
+    for(int i=0;i<(int)femSegs.size();i++){
+        auto& fs=femSegs[i];
+        double segLfs = (fs.maxSideLength>0) ? fs.maxSideLength : -1.0;
+        femSegRange[i]={(int)segs.size(), 1};
+        segs.push_back({fs.n0, fs.n1, fs.marker, segLfs});
+    }
+
+    // ----- Enforce uniform AGE arc discretization -----
+    // Collect AGE definitions and enforce uniform maxSideLength for all arcs in each AGE
+    struct AGEInfo {
+        int bdryIdx;
+        double totalArcLength=0;
+        int totalArcElements=0;
+        double ri=0, ro=0;
+        double cx=0, cy=0;
+        std::vector<int> arcIndices;
+    };
+    std::map<int,AGEInfo> ageInfoMap; // bdryIdx -> AGEInfo
+
+    for(int i=0;i<(int)arcs.size();i++){
+        int bmark=arcs[i].marker;
+        if(bmark>=0) continue;
+        int bdryIdx=(-bmark)-2;
+        if(bdryIdx<0||bdryIdx>=(int)bdryProps.size()) continue;
+        int fmt=bdryProps[bdryIdx].format;
+        if(fmt!=FMT_PERIODIC_AGE && fmt!=FMT_ANTIPERIOD_AGE) continue;
+        // This arc belongs to an AGE boundary
+        auto& info=ageInfoMap[bdryIdx];
+        info.bdryIdx=bdryIdx;
+        info.arcIndices.push_back(i);
+        info.totalArcLength += arcs[i].arcLength;
+        info.totalArcElements += (int)std::ceil(arcs[i].arcLength/arcs[i].maxSideLength);
+
+        // Compute arc center and radius
+        double ax=pts[arcs[i].n0].x, ay=pts[arcs[i].n0].y;
+        double bx=pts[arcs[i].n1].x, by=pts[arcs[i].n1].y;
+        double d=std::sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
+        if(d>1e-30){
+            double tta=arcs[i].arcLength*M_PI/180.0;
+            double R=d/(2.0*std::sin(tta/2.0));
+            double tx=(bx-ax)/d, ty=(by-ay)/d;
+            double h=std::sqrt(std::max(0.0, R*R - d*d/4.0));
+            info.cx=ax + (d/2.0)*tx + h*(-ty);
+            info.cy=ay + (d/2.0)*ty + h*(tx);
+            if(info.ro==0){ info.ri=R; info.ro=R; }
+            if(R>info.ro) info.ro=R;
+            if(R<info.ri) info.ri=R;
+        }
+    }
+
+    // Collect the set of arc indices that belong to any AGE boundary
+    std::unordered_set<int> ageArcIndices;
+    for(auto& [bdryIdx, info]:ageInfoMap)
+        for(int ai:info.arcIndices) ageArcIndices.insert(ai);
+
+    // Apply uniform discretization to AGE arcs
+    for(auto& [bdryIdx, info]:ageInfoMap){
+        if(info.totalArcLength<=0 || info.arcIndices.size()<2) continue;
+        double myMaxSideLength=info.totalArcLength/info.totalArcElements;
+        info.totalArcLength /= 2.0; // now the angle spanned by the AGE (inner+outer halved)
+        // Aspect ratio limit: don't want skinny gap elements
+        double altMaxSideLength=(360.0/M_PI)*(info.ro-info.ri)/(info.ro+info.ri);
+        if(altMaxSideLength<myMaxSideLength) myMaxSideLength=altMaxSideLength;
+        // Round to 1 significant digit (matching FEMM's sprintf kludge for consistency)
+        {char buf[32]; sprintf(buf,"%.1e",myMaxSideLength); sscanf(buf,"%lf",&myMaxSideLength);}
+        // Apply to all arcs in this AGE
+        for(int ai:info.arcIndices)
+            arcs[ai].maxSideLength=myMaxSideLength;
+    }
+
+    // ----- Process arc segments: discretize into chord segments -----
+    std::vector<std::pair<int,int>> femArcRange(arcs.size());
+    for(int ai=0;ai<(int)arcs.size();ai++){
+        auto& arc=arcs[ai];
+        int firstSeg=(int)segs.size();
+        bool isAGE = ageArcIndices.count(ai)>0;
+
+        double ax=pts[arc.n0].x, ay=pts[arc.n0].y;
+        double bx=pts[arc.n1].x, by=pts[arc.n1].y;
+        double d=std::sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
+        if(d<1e-30){ segs.push_back({arc.n0, arc.n1, arc.marker, -1.0, -1, isAGE}); femArcRange[ai]={firstSeg,1}; continue; }
+
+        double tta=arc.arcLength*M_PI/180.0;
+        double R=d/(2.0*std::sin(tta/2.0));
+        double tx=(bx-ax)/d, ty=(by-ay)/d;
+        double h=std::sqrt(std::max(0.0, R*R - d*d/4.0));
+        double cx=ax + (d/2.0)*tx + h*(-ty);
+        double cy=ay + (d/2.0)*ty + h*(tx);
+
+        int k=(int)std::ceil(arc.arcLength/arc.maxSideLength);
+        if(k<1) k=1;
+
+        if(k==1){
+            segs.push_back({arc.n0, arc.n1, arc.marker, -1.0, -1, isAGE});
+        } else {
+            double dtheta=arc.arcLength*M_PI/(180.0*(double)k);
+            double cosD=std::cos(dtheta), sinD=std::sin(dtheta);
+            double px=ax, py=ay;
+
+            int prevIdx=arc.n0;
+            for(int j=0;j<k;j++){
+                double dx=px-cx, dy=py-cy;
+                px=cx + dx*cosD - dy*sinD;
+                py=cy + dx*sinD + dy*cosD;
+
+                if(j<k-1){
+                    int newIdx=(int)pts.size();
+                    pts.push_back({px, py, newIdx, 0, {}});
+                    segs.push_back({prevIdx, newIdx, arc.marker, -1.0, -1, isAGE});
+                    prevIdx=newIdx;
+                } else {
+                    segs.push_back({prevIdx, arc.n1, arc.marker, -1.0, -1, isAGE});
+                }
+            }
+        }
+        // Clear LFS on AGE arc endpoints so smart-mesh dL doesn't
+        // force over-refinement against unsplittable chord edges
+        if(isAGE){
+            pts[arc.n0].lfs = -1.0;
+            pts[arc.n1].lfs = -1.0;
+        }
+        femArcRange[ai]={firstSeg, (int)segs.size()-firstSeg};
+    }
+
+    // ----- Collect AGE node lists (inner/outer rings ordered by angle) -----
+    for(auto& [bdryIdx, info]:ageInfoMap){
+        if(info.totalArcLength<=0 || info.arcIndices.size()<2) continue;
+        double midR=(info.ri+info.ro)/2.0;
+        AGEDef age;
+        age.name=bdryProps[bdryIdx].name;
+        age.format=(bdryProps[bdryIdx].format==FMT_PERIODIC_AGE)?0:1; // 0=periodic, 1=anti-periodic
+        age.innerAngle=bdryProps[bdryIdx].innerAngle;
+        age.outerAngle=bdryProps[bdryIdx].outerAngle;
+        age.ri=info.ri; age.ro=info.ro;
+        age.totalArcLength=info.totalArcLength;
+        age.cx=info.cx; age.cy=info.cy;
+
+        // Walk each AGE arc's chord segments to collect nodes
+        for(int ai:info.arcIndices){
+            auto [firstSeg, nChords]=femArcRange[ai];
+            // Determine radius of this arc
+            double ax=pts[arcs[ai].n0].x, ay=pts[arcs[ai].n0].y;
+            double R=std::sqrt((ax-info.cx)*(ax-info.cx) + (ay-info.cy)*(ay-info.cy));
+            bool isOuter=(R>midR);
+
+            // Collect nodes along this arc: start node, then walk chords
+            auto& ring=isOuter ? age.outerNodes : age.innerNodes;
+            ring.push_back(segs[firstSeg].v0); // start node
+            for(int j=0;j<nChords;j++){
+                // Each chord's v1 is the next node (including the final endpoint)
+                if(j<nChords-1){
+                    ring.push_back(segs[firstSeg+j].v1);
+                }
+                // Last chord's v1 is the arc endpoint — don't add it here,
+                // it will be the start node of the next arc or the final node
+            }
+        }
+
+        // Collect nodes: start node + interior chord nodes (exclude arc end node,
+        // matching FEMM's convention — end node is shared with PBC radial segment)
+        age.innerNodes.clear();
+        age.outerNodes.clear();
+        for(int ai:info.arcIndices){
+            auto [firstSeg, nChords]=femArcRange[ai];
+            double ax=pts[arcs[ai].n0].x, ay=pts[arcs[ai].n0].y;
+            double R=std::sqrt((ax-info.cx)*(ax-info.cx) + (ay-info.cy)*(ay-info.cy));
+            bool isOuter=(R>midR);
+            auto& ring=isOuter ? age.outerNodes : age.innerNodes;
+
+            // Start node of this arc
+            ring.push_back(segs[firstSeg].v0);
+            // Interior chord endpoints (not the final arc endpoint)
+            for(int j=0;j<nChords-1;j++)
+                ring.push_back(segs[firstSeg+j].v1);
+        }
+
+        // Remove duplicate nodes at arc junctions (where end of one arc = start of next)
+        auto dedup=[](std::vector<int>& v){
+            if(v.size()<2) return;
+            std::vector<int> out; out.push_back(v[0]);
+            for(int i=1;i<(int)v.size();i++)
+                if(v[i]!=v[i-1]) out.push_back(v[i]);
+            v=std::move(out);
+        };
+        dedup(age.innerNodes);
+        dedup(age.outerNodes);
+
+        // Sort each ring by angle relative to AGE center
+        auto angleSort=[&](std::vector<int>& ring){
+            std::sort(ring.begin(), ring.end(), [&](int a, int b){
+                double angA=std::atan2(pts[a].y-info.cy, pts[a].x-info.cx);
+                double angB=std::atan2(pts[b].y-info.cy, pts[b].x-info.cx);
+                return angA<angB;
+            });
+        };
+        angleSort(age.innerNodes);
+        angleSort(age.outerNodes);
+
+        age.n=(int)age.innerNodes.size();
+        if((int)age.outerNodes.size()!=age.n){
+            std::cerr<<"Warning: AGE '"<<age.name<<"' inner/outer node count mismatch ("
+                     <<age.innerNodes.size()<<" vs "<<age.outerNodes.size()<<")\n";
+        }
+        ageDefs.push_back(std::move(age));
+    }
+
+    // ----- Set up PBC segment pairing -----
+    // Group .fem segments and arcs by PBC boundary marker.
+    // Each PBC boundary (BdryFormat 4 or 5) should have exactly 2 entities.
+    {
+        // Map from boundary property index to list of .fem segment indices
+        std::map<int,std::vector<int>> pbcFemSegs; // bdry_idx -> fem segment indices
+        std::map<int,std::vector<int>> pbcFemArcs; // bdry_idx -> fem arc indices
+
+        for(int i=0;i<(int)femSegs.size();i++){
+            int bmark=femSegs[i].marker; // already encoded as -(bmark+1)
+            if(bmark>=0) continue;
+            int bdryIdx=(-bmark)-2; // convert to 0-based boundary property index
+            if(bdryIdx<0||bdryIdx>=(int)bdryProps.size()) continue;
+            int fmt=bdryProps[bdryIdx].format;
+            if(fmt==FMT_PERIODIC||fmt==FMT_ANTIPERIODIC) pbcFemSegs[bdryIdx].push_back(i);
+        }
+        for(int i=0;i<(int)arcs.size();i++){
+            int bmark=arcs[i].marker;
+            if(bmark>=0) continue;
+            int bdryIdx=(-bmark)-2;
+            if(bdryIdx<0||bdryIdx>=(int)bdryProps.size()) continue;
+            int fmt=bdryProps[bdryIdx].format;
+            if(fmt==FMT_PERIODIC||fmt==FMT_ANTIPERIODIC) pbcFemArcs[bdryIdx].push_back(i);
+        }
+
+        // Pair straight segments
+        for(auto& [bdryIdx, indices]:pbcFemSegs){
+            if(indices.size()!=2){
+                std::cerr<<"Warning: PBC boundary '"<<bdryProps[bdryIdx].name
+                         <<"' has "<<indices.size()<<" segments (expected 2)\n";
+                continue;
+            }
+            int type=(bdryProps[bdryIdx].format==FMT_PERIODIC)?0:1; // 0=periodic, 1=anti-periodic
+            int fi0=indices[0], fi1=indices[1];
+            auto [s0,n0]=femSegRange[fi0];
+            auto [s1,n1]=femSegRange[fi1];
+            if(n0!=1||n1!=1) continue; // should be single segments
+
+            // Just tag with pbc_type — orientation and node pairing are
+            // determined from CDT by buildPbcTwinFromCDT after hole removal.
+            segs[s0].pbc_type=type;
+            segs[s1].pbc_type=type;
+        }
+
+        // Pair arc-derived chord segments
+        for(auto& [bdryIdx, indices]:pbcFemArcs){
+            if(indices.size()!=2){
+                std::cerr<<"Warning: PBC boundary '"<<bdryProps[bdryIdx].name
+                         <<"' has "<<indices.size()<<" arcs (expected 2)\n";
+                continue;
+            }
+            int type=(bdryProps[bdryIdx].format==FMT_PERIODIC)?0:1;
+            int ai0=indices[0], ai1=indices[1];
+            auto [s0,n0]=femArcRange[ai0];
+            auto [s1,n1]=femArcRange[ai1];
+            if(n0!=n1){
+                std::cerr<<"Warning: PBC arcs '"<<bdryProps[bdryIdx].name
+                         <<"' have different chord counts ("<<n0<<" vs "<<n1<<")\n";
+                continue;
+            }
+            // Just tag all arc chord segments with pbc_type — orientation
+            // and node pairing are handled by buildPbcTwinFromCDT.
+            for(int j=0;j<n0;j++){
+                segs[s0+j].pbc_type=type;
+                segs[s1+j].pbc_type=type;
+            }
+        }
+    }
+
+    // ----- Default mesh size for regions without explicit area constraints -----
+    if(!pts.empty()){
+        double minX=pts[0].x, maxX=minX, minY=pts[0].y, maxY=minY;
+        for(auto& p:pts){
+            minX=std::min(minX,p.x); maxX=std::max(maxX,p.x);
+            minY=std::min(minY,p.y); maxY=std::max(maxY,p.y);
+        }
+        double diagLen=std::sqrt((maxX-minX)*(maxX-minX) + (maxY-minY)*(maxY-minY));
+        double defaultArea;
+        if(doSmartMesh)
+            defaultArea=std::pow(diagLen/BBOXFRACTION, 2.0);
+        else
+            defaultArea=diagLen*diagLen; // very large default
+
+        for(auto& r:regions){
+            if(r.max_area<=0 || r.max_area>defaultArea) r.max_area=defaultArea;
+        }
+    }
+
+    // ----- Set options to match FEMM's Triangle invocation -----
+    opts.pslg=true;
+    opts.clean_pslg=true; // enforce PSLG in case Lua scripts bypassed GUI's EnforcePSLG
+    opts.quality=true;
+    opts.min_angle=std::min(minAngle, MINANGLE_MAX_VAL);
+    opts.edges=true;
+    opts.regions=true;
+    opts.area_limit=true;
+    opts.zero_indexed=true;
+    opts.first_index=0;
+    opts.suppress_iter=true;
+    opts.jettison=true;
+    opts.no_poly_out=true;
+    opts.no_lfs_output=true; // FEMM solver doesn't understand LFS column
+
+    return true;
+}
 
 void writeNodeFile(const std::string& fn, const std::vector<Point>& pts,
                    int nAttribs, bool hasMarkers, const Options& opts){
     std::ofstream f(fn);
     f<<std::setprecision(17);
     bool hasLfs=false;
-    for(auto& p:pts) if(p.lfs>0){hasLfs=true;break;}
+    if(!opts.no_lfs_output)
+        for(auto& p:pts) if(p.lfs>0){hasLfs=true;break;}
     f<<pts.size()<<" 2 "<<nAttribs<<" "<<(hasMarkers?1:0)<<"\n";
     for(int i=0;i<(int)pts.size();i++){
         int outIdx=opts.zero_indexed?i:(i+1);
@@ -2801,6 +3788,102 @@ void writePbcFile(const std::string& fn, const Mesh& mesh, const Options& opts){
         auto& p=mesh.pbc_pairs[i];
         f<<i<<" "<<p.node_a<<" "<<p.node_b<<" "<<p.type<<"\n";
     }
+
+    // Write AGE definitions
+    // Replicates FEMM's writepoly.cpp FunnyOnWritePoly() AGE output format.
+    // Builds full-circle rings by rotating sector nodes through periodicity copies,
+    // using conjugate rotation to compute angular positions in element units.
+    f<<mesh.age_defs.size()<<"\n";
+    for(auto& age:mesh.age_defs){
+        int n=age.n; // nodes per ring in one sector
+        if(n<1) continue;
+        double dtta=age.totalArcLength/n; // angular spacing per element (degrees)
+        int n0=(int)std::round(360.0/dtta); // total elements in full 360° ring
+        int n1=(int)std::round(360.0/age.totalArcLength); // number of periodicity copies
+
+        // Build full-circle rings via conjugate rotation (matching FEMM's algorithm)
+        struct RingPt { int node; double w; double sign; };
+        std::vector<RingPt> innerRing(n0), outerRing(n0);
+
+        int kk=0;
+        for(int j=0;j<n1;j++){
+            double dL=1.0;
+            if(age.format==1 && (j%2!=0)) dL=-1.0; // anti-periodic odd copies
+
+            // Rotation angles for inner and outer arcs
+            double iRotDeg = j*age.totalArcLength + age.innerAngle;
+            double oRotDeg = j*age.totalArcLength + age.outerAngle;
+            double iRotRad = iRotDeg*M_PI/180.0;
+            double oRotRad = oRotDeg*M_PI/180.0;
+            double cosI=std::cos(iRotRad), sinI=std::sin(iRotRad);
+            double cosO=std::cos(oRotRad), sinO=std::sin(oRotRad);
+
+            for(int i=0;i<n;i++){
+                // Rotate inner node: exp(I*rot) * (node - center)
+                // (cosR + i*sinR) * (dx + i*dy) = (cosR*dx - sinR*dy) + i*(sinR*dx + cosR*dy)
+                double dx=mesh.vertices[age.innerNodes[i]].x - age.cx;
+                double dy=mesh.vertices[age.innerNodes[i]].y - age.cy;
+                double rx=cosI*dx - sinI*dy;
+                double ry=sinI*dx + cosI*dy;
+                double ang=std::atan2(ry, rx)*180.0/M_PI;
+                if(ang<0) ang+=360.0;
+                innerRing[kk].node=age.innerNodes[i];
+                innerRing[kk].w=ang/dtta;
+                innerRing[kk].sign=dL;
+
+                // Rotate outer node
+                dx=mesh.vertices[age.outerNodes[i]].x - age.cx;
+                dy=mesh.vertices[age.outerNodes[i]].y - age.cy;
+                rx=cosO*dx - sinO*dy;
+                ry=sinO*dx + cosO*dy;
+                ang=std::atan2(ry, rx)*180.0/M_PI;
+                if(ang<0) ang+=360.0;
+                outerRing[kk].node=age.outerNodes[i];
+                outerRing[kk].w=ang/dtta;
+                outerRing[kk].sign=dL;
+
+                kk++;
+            }
+        }
+
+        // Sort rings by angular position (bubble sort matching FEMM)
+        for(int ii=0;ii<n0;ii++){
+            bool done=true;
+            for(int jj=0;jj<n0-1;jj++){
+                if(innerRing[jj].w>innerRing[jj+1].w){
+                    std::swap(innerRing[jj],innerRing[jj+1]); done=false;
+                }
+            }
+            if(done) break;
+        }
+        for(int ii=0;ii<n0;ii++){
+            bool done=true;
+            for(int jj=0;jj<n0-1;jj++){
+                if(outerRing[jj].w>outerRing[jj+1].w){
+                    std::swap(outerRing[jj],outerRing[jj+1]); done=false;
+                }
+            }
+            if(done) break;
+        }
+
+        // Write AGE header
+        f<<"\""<<age.name<<"\"\n";
+        f<<age.format<<" "<<age.innerAngle<<" "<<age.outerAngle<<" "
+         <<age.ri<<" "<<age.ro<<" "<<age.totalArcLength<<" "
+         <<age.cx<<" "<<age.cy<<" "<<n<<" "
+         <<innerRing[0].w<<" "<<outerRing[0].w<<"\n";
+
+        // Write bracketing node pairs for each structured element position
+        for(int i=0;i<=n;i++){
+            int p1=i; if(p1>=n0) p1=0;
+            int p0=p1-1; if(p0<0) p0=n0+p0;
+
+            f<<innerRing[p0].node<<" "<<innerRing[p0].sign<<" "
+             <<innerRing[p1].node<<" "<<innerRing[p1].sign<<" "
+             <<outerRing[p0].node<<" "<<outerRing[p0].sign<<" "
+             <<outerRing[p1].node<<" "<<outerRing[p1].sign<<"\n";
+        }
+    }
 }
 
 // ============================================================
@@ -2840,6 +3923,7 @@ Options parseOptions(const std::string& switchStr){
             case 'O': opts.no_holes=true; break;
             case 'Y': opts.no_steiner=true; break;
             case 'n': opts.neighbors=true; break;
+            case 'x': opts.stamp=true; break;
             case 'C':
                 opts.clean_pslg=true;
                 if(i<(int)switchStr.size()&&(std::isdigit(switchStr[i])||switchStr[i]=='.')){
@@ -2853,7 +3937,6 @@ Options parseOptions(const std::string& switchStr){
     return opts;
 }
 
-// ============================================================
 // PSLG cleanup (-C flag): merge near-duplicate nodes, split
 // segments at intersections, remove duplicate segments.
 // Adapted from FEMM's EnforcePSLG().
@@ -2871,23 +3954,33 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
             minX=std::min(minX,p.x); maxX=std::max(maxX,p.x);
             minY=std::min(minY,p.y); maxY=std::max(maxY,p.y);
         }
-        tol = std::sqrt((maxX-minX)*(maxX-minX)+(maxY-minY)*(maxY-minY)) * 1e-6;
+        tol = std::sqrt((maxX-minX)*(maxX-minX)+(maxY-minY)*(maxY-minY)) * CLOSE_ENOUGH;
     }
     double tol2 = tol * tol;
 
     int mergedNodes=0, splitSegs=0, removedSegs=0;
 
-    // 1. Merge near-duplicate nodes
+    // 1. Merge near-duplicate nodes (x-sorted sweep to avoid O(n²))
     std::vector<int> remap(nv);
     std::iota(remap.begin(), remap.end(), 0);
-    for(int i=0; i<nv; i++){
-        if(remap[i] != i) continue; // already merged
-        for(int j=i+1; j<nv; j++){
-            if(remap[j] != j) continue;
-            double dx=pts[j].x-pts[i].x, dy=pts[j].y-pts[i].y;
-            if(dx*dx+dy*dy < tol2){
-                remap[j] = i;
-                mergedNodes++;
+    {
+        std::vector<int> xorder(nv);
+        std::iota(xorder.begin(), xorder.end(), 0);
+        std::sort(xorder.begin(), xorder.end(), [&](int a, int b){
+            return pts[a].x < pts[b].x;
+        });
+        for(int ii=0; ii<nv; ii++){
+            int i=xorder[ii];
+            if(remap[i] != i) continue;
+            for(int jj=ii+1; jj<nv; jj++){
+                int j=xorder[jj];
+                if(pts[j].x - pts[i].x > tol) break; // x-sorted: no more candidates
+                if(remap[j] != j) continue;
+                double dx=pts[j].x-pts[i].x, dy=pts[j].y-pts[i].y;
+                if(dx*dx+dy*dy < tol2){
+                    remap[j] = i;
+                    mergedNodes++;
+                }
             }
         }
     }
@@ -2896,7 +3989,6 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
         s.v0 = remap[s.v0];
         s.v1 = remap[s.v1];
     }
-    // Apply remap to holes and regions
     // (holes/regions use coordinates, not indices, so no remap needed)
 
     // 2. Remove degenerate segments (both endpoints same after merge)
@@ -2932,11 +4024,14 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
                 double dx=bx-ax, dy=by-ay;
                 double len2=dx*dx+dy*dy;
                 if(len2 < tol2) continue;
+                // segment bounding box (expanded by tol)
+                double sx0=std::min(ax,bx)-tol, sx1=std::max(ax,bx)+tol;
+                double sy0=std::min(ay,by)-tol, sy1=std::max(ay,by)+tol;
                 for(int i=0; i<(int)pts.size(); i++){
                     if(i==v0 || i==v1) continue;
                     if(remap[i] != i && i < nv) continue; // merged away
+                    if(pts[i].x<sx0 || pts[i].x>sx1 || pts[i].y<sy0 || pts[i].y>sy1) continue;
                     double px=pts[i].x-ax, py=pts[i].y-ay;
-                    // Distance from point to line segment
                     double t = (dx*px+dy*py)/len2;
                     if(t <= tol/std::sqrt(len2) || t >= 1.0-tol/std::sqrt(len2)) continue;
                     double cross = dx*py - dy*px;
@@ -2948,7 +4043,7 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
                     segs.push_back(s2);
                     splitSegs++;
                     changed = true;
-                    break; // restart this segment (now shorter)
+                    break;
                 }
             }
         }
@@ -2962,10 +4057,19 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
             for(int i=0; i<(int)segs.size() && !changed; i++){
                 double ax=pts[segs[i].v0].x, ay=pts[segs[i].v0].y;
                 double bx=pts[segs[i].v1].x, by=pts[segs[i].v1].y;
+                double ax0=std::min(ax,bx), ax1=std::max(ax,bx);
+                double ay0=std::min(ay,by), ay1=std::max(ay,by);
                 for(int j=i+1; j<(int)segs.size() && !changed; j++){
                     // Skip if they share an endpoint
                     if(segs[i].v0==segs[j].v0 || segs[i].v0==segs[j].v1 ||
                        segs[i].v1==segs[j].v0 || segs[i].v1==segs[j].v1) continue;
+                    // Bounding box pre-filter
+                    double bx0=std::min(pts[segs[j].v0].x,pts[segs[j].v1].x);
+                    double bx1=std::max(pts[segs[j].v0].x,pts[segs[j].v1].x);
+                    if(ax1<bx0 || ax0>bx1) continue;
+                    double by0=std::min(pts[segs[j].v0].y,pts[segs[j].v1].y);
+                    double by1=std::max(pts[segs[j].v0].y,pts[segs[j].v1].y);
+                    if(ay1<by0 || ay0>by1) continue;
                     double cx=pts[segs[j].v0].x, cy=pts[segs[j].v0].y;
                     double dx2=pts[segs[j].v1].x, dy2=pts[segs[j].v1].y;
                     // Compute intersection
@@ -3056,6 +4160,7 @@ void printUsage(){
 "Input: .node or .poly files. Output: .1.node .1.ele [.1.edge] [.1.neigh] [.1.poly]\n";
 }
 
+#ifndef TANGLE_AS_LIBRARY
 int main(int argc, char* argv[]){
     if(argc<2){printUsage();return 1;}
 
@@ -3069,122 +4174,33 @@ int main(int argc, char* argv[]){
 
     Options opts=parseOptions(switchStr);
 
-    // KLUDGE: FEMM compatibility hack — REMOVE THIS LATER.
-    // FEMM adds 3° to the -q angle when calling Triangle 1.6, because 1.6
-    // produces sparser meshes than 1.3.  Tangle's mesh density is closer to
-    // 1.3, so the extra 3° produces overly dense meshes.  When tangle is
-    // invoked as "triangle" (drop-in replacement), subtract the 3° back out.
-    {
-        std::string prog=argv[0];
-        auto slash=prog.find_last_of("/\\");
-        if(slash!=std::string::npos) prog=prog.substr(slash+1);
-        auto dotpos=prog.rfind('.');
-        if(dotpos!=std::string::npos) prog=prog.substr(0,dotpos);
-        for(auto& ch:prog) ch=std::tolower(ch);
-        if(prog=="triangle"){
-            if(opts.quality && opts.min_angle>3.0)
-                opts.min_angle-=3.0;
-        }
-    }
-
     std::string base=inputFile, ext;
     auto dot=base.rfind('.');
     if(dot!=std::string::npos){ext=base.substr(dot);base=base.substr(0,dot);}
+    if(ext.empty()){
+        // Try FEMM extensions first if no extension given
+        for(auto tryExt:{".fem",".fee",".feh",".fec"}){
+            std::ifstream test(inputFile+tryExt);
+            if(test.good()){ext=tryExt;inputFile+=ext;base=inputFile.substr(0,inputFile.size()-4);break;}
+        }
+    }
     if(ext.empty()){ext=opts.pslg?".poly":".node";inputFile+=ext;}
+
     Mesh mesh;
     int nAttribs=0, nMarkers=0;
 
-    if(opts.pslg||ext==".poly"){
+    // Detect FEMM file extensions
+    bool isFem = (ext==".fem"||ext==".fee"||ext==".feh"||ext==".fec");
+
+    if(isFem){
+        if(!readFemFile(inputFile,mesh.vertices,mesh.segments,mesh.holes,mesh.regions,opts,mesh.age_defs))
+            return 1;
+    } else if(opts.pslg||ext==".poly"){
         opts.pslg=true;
         if(!readPolyFile(inputFile,mesh,nAttribs))
             return 1;
-        // Build PBC twin map for .poly PBC definitions.
-        // PBC in .poly uses marker pairs: segments with marker_a pair with marker_b.
-        // We find the two chains by marker and pair nodes by arc-length parameter.
-        {
-            // Collect distinct PBC marker groups
-            std::set<int> pbcMarkers;
-            for(auto& s:mesh.segments)
-                if(s.pbc_type>=0) pbcMarkers.insert(s.marker);
-
-            if(!pbcMarkers.empty()){
-                auto buildChain=[&](const std::vector<int>& segIndices) -> std::vector<int> {
-                    if(segIndices.empty()) return {};
-                    std::map<int,std::vector<int>> nodeSegs;
-                    for(int si:segIndices){
-                        nodeSegs[mesh.segments[si].v0].push_back(si);
-                        nodeSegs[mesh.segments[si].v1].push_back(si);
-                    }
-                    int startNode=-1;
-                    for(auto& [node, slist]:nodeSegs)
-                        if(slist.size()==1){ startNode=node; break; }
-                    if(startNode<0) return {};
-                    std::vector<int> chain; chain.push_back(startNode);
-                    std::set<int> visited; int curNode=startNode;
-                    while(true){
-                        bool found=false;
-                        for(int si:nodeSegs[curNode]){
-                            if(visited.count(si)) continue;
-                            visited.insert(si);
-                            auto& s=mesh.segments[si];
-                            int next=(s.v0==curNode)?s.v1:s.v0;
-                            chain.push_back(next); curNode=next; found=true; break;
-                        }
-                        if(!found) break;
-                    }
-                    return chain;
-                };
-
-                // Group PBC markers into pairs by pbc_type
-                // Each pair of markers with the same pbc_type forms a PBC boundary
-                std::map<int,std::vector<int>> typeToMarkers; // pbc_type -> list of markers
-                for(int m:pbcMarkers){
-                    int pt=-1;
-                    for(auto& s:mesh.segments)
-                        if(s.marker==m && s.pbc_type>=0){ pt=s.pbc_type; break; }
-                    if(pt>=0) typeToMarkers[pt].push_back(m);
-                }
-
-                for(auto& [pbcType, markers]:typeToMarkers){
-                    // Process pairs of markers
-                    for(int mi=0;mi+1<(int)markers.size();mi+=2){
-                        int mA=markers[mi], mB=markers[mi+1];
-                        std::vector<int> segsA, segsB;
-                        for(int si=0;si<(int)mesh.segments.size();si++){
-                            if(mesh.segments[si].marker==mA && mesh.segments[si].pbc_type>=0)
-                                segsA.push_back(si);
-                            if(mesh.segments[si].marker==mB && mesh.segments[si].pbc_type>=0)
-                                segsB.push_back(si);
-                        }
-                        auto chainA=buildChain(segsA), chainB=buildChain(segsB);
-                        if(chainA.empty()||chainB.empty()) continue;
-                        if(chainA.size()!=chainB.size()){
-                            std::cerr<<"Warning: PBC markers "<<mA<<" and "<<mB
-                                     <<" have different chain lengths ("<<chainA.size()
-                                     <<" vs "<<chainB.size()<<")\n";
-                            continue;
-                        }
-                        // Orient chains consistently
-                        auto dist2=[&](int a, int b){
-                            double dx=mesh.vertices[a].x-mesh.vertices[b].x;
-                            double dy=mesh.vertices[a].y-mesh.vertices[b].y;
-                            return dx*dx+dy*dy;
-                        };
-                        double d_same=dist2(chainA[0],chainB[0])+dist2(chainA.back(),chainB.back());
-                        double d_rev=dist2(chainA[0],chainB.back())+dist2(chainA.back(),chainB[0]);
-                        if(d_rev<d_same) std::reverse(chainB.begin(), chainB.end());
-
-                        for(int i=0;i<(int)chainA.size();i++){
-                            int a=chainA[i], b=chainB[i];
-                            if(a==b) continue;
-                            mesh.pbc_twin[a]=b; mesh.pbc_twin[b]=a;
-                            mesh.pbc_node_type[a]=pbcType;
-                            mesh.pbc_node_type[b]=pbcType;
-                        }
-                    }
-                }
-            }
-        }
+        // readPolyFile tags PBC segments with pbc_type;
+        // buildPbcTwinFromCDT (after hole removal) handles node pairing.
     } else {
         if(!readNodeFile(inputFile,mesh.vertices,nAttribs,nMarkers)) return 1;
     }
@@ -3245,7 +4261,7 @@ int main(int argc, char* argv[]){
             double sumSegLen=0;
             for(auto& s:mesh.segments){
                 auto& a=mesh.vertices[s.v0]; auto& b=mesh.vertices[s.v1];
-                sumSegLen+=std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y));
+                sumSegLen+=std::sqrt((b.x-a.x)*(b.x-a.x) + (b.y-a.y)*(b.y-a.y));
             }
             double avgSegLen = sumSegLen / std::max(1,(int)mesh.segments.size());
             double minSplitLen = avgSegLen * 2.0;
@@ -3277,8 +4293,9 @@ int main(int argc, char* argv[]){
                 mesh.vertices.push_back({mx, my, midIdx, bm, {}});
 
                 int v0=seg.v0, v1=seg.v1, mk=seg.marker;
-                mesh.segments[si] = {v0, midIdx, mk};
-                mesh.segments.insert(mesh.segments.begin()+si+1, {midIdx, v1, mk});
+                double slfs=seg.lfs; int spt=seg.pbc_type;
+                mesh.segments[si] = {v0, midIdx, mk, slfs, spt};
+                mesh.segments.insert(mesh.segments.begin()+si+1, {midIdx, v1, mk, slfs, spt});
                 nSplit++;
             }
             if(!opts.quiet)
@@ -3295,6 +4312,12 @@ int main(int argc, char* argv[]){
     // 3. Remove holes via flood fill
     if(opts.pslg) removeHoles(mesh, opts);
     if(!opts.quiet) std::cerr<<"  Holes: "<<elapsed()<<" ms\n";
+
+    // 3b. Build PBC twin map from CDT orientation.
+    // Must run AFTER removeHoles: PBC segments are exterior edges, so
+    // after hole removal each has exactly one adjacent (interior) triangle.
+    // This gives unambiguous, consistent orientation for all PBC segments.
+    buildPbcTwinFromCDT(mesh);
 
     // 4. Assign regions via flood fill on the coarse mesh
     if(opts.regions) assignRegions(mesh, opts);
@@ -3362,7 +4385,43 @@ int main(int argc, char* argv[]){
     if(opts.edges) writeEdgeFile(outBase+".edge",mesh,opts);
     if(opts.neighbors) writeNeighFile(outBase+".neigh",mesh,opts);
     if(opts.pslg&&!opts.no_poly_out) writePolyFile(outBase+".poly",mesh,opts);
-    if(!mesh.pbc_pairs.empty()) writePbcFile(outBase+".pbc",mesh,opts);
+    if(!mesh.pbc_pairs.empty()||!mesh.age_defs.empty()) writePbcFile(outBase+".pbc",mesh,opts);
+
+    // Write stamp file: all mesh nodes, but only edges that are NOT
+    // part of input segments. When the stamp is pasted, boundary nodes
+    // split existing segments naturally, and non-segment edges get
+    // enforced as mesh constraints.
+    if(opts.stamp){
+        // Build set of segment edges (input segments, including split sub-segments)
+        std::set<std::pair<int,int>> segEdges;
+        for(auto& s:mesh.segments)
+            segEdges.insert({std::min(s.v0,s.v1),std::max(s.v0,s.v1)});
+
+        // Collect all mesh edges that are NOT segment edges
+        std::set<std::pair<int,int>> stampEdges;
+        for(auto& t:mesh.triangles){
+            for(int j=0;j<3;j++){
+                int a=t.v[j], b=t.v[(j+1)%3];
+                auto ek=std::make_pair(std::min(a,b),std::max(a,b));
+                if(!segEdges.count(ek))
+                    stampEdges.insert(ek);
+            }
+        }
+
+        int nv=(int)mesh.vertices.size();
+        std::string stampFile=base+".tstamp";
+        std::ofstream sf(stampFile);
+        sf<<std::setprecision(15);
+        sf<<nv<<" "<<stampEdges.size()<<"\n";
+        for(int i=0;i<nv;i++)
+            sf<<i<<" "<<mesh.vertices[i].x<<" "<<mesh.vertices[i].y<<"\n";
+        for(auto& [a,b]:stampEdges)
+            sf<<a<<" "<<b<<"\n";
+
+        if(!opts.quiet)
+            std::cerr<<"Stamp: "<<nv<<" nodes, "
+                     <<stampEdges.size()<<" non-segment edges -> "<<stampFile<<"\n";
+    }
 
     if(!opts.quiet){
         std::cerr<<"Wrote "<<outBase<<".node, "<<outBase<<".ele";
@@ -3370,7 +4429,154 @@ int main(int argc, char* argv[]){
         if(opts.neighbors) std::cerr<<", "<<outBase<<".neigh";
         if(opts.pslg&&!opts.no_poly_out) std::cerr<<", "<<outBase<<".poly";
         if(!mesh.pbc_pairs.empty()) std::cerr<<", "<<outBase<<".pbc";
+        if(opts.stamp) std::cerr<<", "<<base<<".tstamp";
         std::cerr<<"\n";
     }
+    return 0;
+}
+#endif // TANGLE_AS_LIBRARY
+
+// ============================================================
+// Library API: mesh a .fem file and return the Mesh in memory
+// ============================================================
+
+int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
+{
+    std::string inputFile = inputBase;
+    std::string ext;
+
+    // Find the .fem file
+    for(auto tryExt : {".fem", ".fee", ".feh", ".fec"}){
+        std::ifstream test(inputFile + tryExt);
+        if(test.good()){ ext = tryExt; inputFile += ext; break; }
+    }
+    if(ext.empty()){
+        std::cerr << "Could not find .fem file for: " << inputBase << "\n";
+        return 1;
+    }
+
+    Options opts;
+    Mesh mesh;
+
+    if(!readFemFile(inputFile, mesh.vertices, mesh.segments, mesh.holes,
+                    mesh.regions, opts, mesh.age_defs))
+        return 1;
+
+    opts.quiet = true;  // suppress meshing diagnostics when called as library
+
+    // Coordinate shift for numerical precision
+    double shiftX=0, shiftY=0;
+    if(!mesh.vertices.empty()){
+        double minX=mesh.vertices[0].x, maxX=minX, minY=mesh.vertices[0].y, maxY=minY;
+        for(auto& p:mesh.vertices){ minX=std::min(minX,p.x); maxX=std::max(maxX,p.x); minY=std::min(minY,p.y); maxY=std::max(maxY,p.y); }
+        shiftX=(minX+maxX)*0.5; shiftY=(minY+maxY)*0.5;
+        for(auto& p:mesh.vertices){ p.x-=shiftX; p.y-=shiftY; }
+        for(auto& h:mesh.holes){ h.x-=shiftX; h.y-=shiftY; }
+        for(auto& r:mesh.regions){ r.x-=shiftX; r.y-=shiftY; }
+    }
+
+    if(!opts.quiet){
+        std::cerr<<"Input: "<<mesh.vertices.size()<<" vertices";
+        if(!mesh.segments.empty()) std::cerr<<", "<<mesh.segments.size()<<" segments";
+        if(!mesh.regions.empty()) std::cerr<<", "<<mesh.regions.size()<<" regions";
+        std::cerr<<"\n";
+    }
+
+    // Full meshing pipeline
+    if(opts.clean_pslg && opts.pslg) cleanPSLG(mesh, opts.clean_tol, opts.quiet);
+    buildDelaunay(mesh);
+    mesh.rebuildAdjacency();
+    if(opts.pslg){
+        int miss = enforceConstraints(mesh, opts.quiet);
+        for(int splitRound=0; splitRound<10 && miss>0; splitRound++){
+            double sumSegLen=0;
+            for(auto& s:mesh.segments){
+                auto& a=mesh.vertices[s.v0]; auto& b=mesh.vertices[s.v1];
+                sumSegLen+=std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y));
+            }
+            double avgSegLen = sumSegLen / std::max(1,(int)mesh.segments.size());
+            double minSplitLen = avgSegLen * 2.0;
+            std::vector<std::vector<int>> v2t(mesh.vertices.size());
+            for(int i=0;i<(int)mesh.triangles.size();i++){
+                auto& t=mesh.triangles[i]; if(t.v[0]<0) continue;
+                for(int j=0;j<3;j++) v2t[t.v[j]].push_back(i);
+            }
+            std::vector<int> toSplit;
+            for(int i=0;i<(int)mesh.segments.size();i++){
+                if(mesh.hasEdge(mesh.segments[i].v0,mesh.segments[i].v1,v2t)) continue;
+                auto& a=mesh.vertices[mesh.segments[i].v0];
+                auto& b=mesh.vertices[mesh.segments[i].v1];
+                if(std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y)) >= minSplitLen)
+                    toSplit.push_back(i);
+            }
+            if(toSplit.empty()) break;
+            for(int ii=(int)toSplit.size()-1; ii>=0; ii--){
+                int si=toSplit[ii]; auto& seg=mesh.segments[si];
+                double mx=(mesh.vertices[seg.v0].x+mesh.vertices[seg.v1].x)/2;
+                double my=(mesh.vertices[seg.v0].y+mesh.vertices[seg.v1].y)/2;
+                int bm=std::max(mesh.vertices[seg.v0].marker,mesh.vertices[seg.v1].marker);
+                int midIdx=(int)mesh.vertices.size();
+                mesh.vertices.push_back({mx,my,midIdx,bm,{}});
+                int v0=seg.v0, v1=seg.v1, mk=seg.marker;
+                double slfs=seg.lfs; int spt=seg.pbc_type;
+                mesh.segments[si]={v0,midIdx,mk,slfs,spt};
+                mesh.segments.insert(mesh.segments.begin()+si+1,{midIdx,v1,mk,slfs,spt});
+            }
+            mesh.triangles.clear();
+            buildDelaunay(mesh);
+            mesh.rebuildAdjacency();
+            miss = enforceConstraints(mesh, opts.quiet);
+        }
+    }
+    if(opts.pslg) removeHoles(mesh, opts);
+    buildPbcTwinFromCDT(mesh);
+    if(opts.regions) assignRegions(mesh, opts);
+    int nInputVerts = (int)mesh.vertices.size();
+    if(opts.quality||opts.area_limit) refineQuality(mesh, opts, nInputVerts);
+
+    // Final cleanup
+    {
+        std::vector<Triangle> live;
+        for(auto& t:mesh.triangles) if(t.v[0]>=0) live.push_back(t);
+        mesh.triangles=live;
+    }
+    mesh.rebuildAdjacency();
+    extractEdges(mesh);
+
+    // Build PBC output pairs
+    {
+        std::set<std::pair<int,int>> seen;
+        for(auto& [a, b] : mesh.pbc_twin){
+            if(a==b) continue;
+            auto key=std::make_pair(std::min(a,b), std::max(a,b));
+            if(seen.insert(key).second){
+                int type=mesh.pbc_node_type.count(a)?mesh.pbc_node_type[a]:0;
+                mesh.pbc_pairs.push_back({a, b, type});
+            }
+        }
+    }
+
+    // Jettison unused vertices
+    {
+        std::vector<bool> used(mesh.vertices.size(),false);
+        for(auto& t:mesh.triangles){used[t.v[0]]=used[t.v[1]]=used[t.v[2]]=true;}
+        std::vector<int> vremap(mesh.vertices.size(),-1);
+        std::vector<Point> newPts;
+        for(int i=0;i<(int)mesh.vertices.size();i++)
+            if(used[i]){vremap[i]=(int)newPts.size();newPts.push_back(mesh.vertices[i]);}
+        mesh.vertices=newPts;
+        for(auto& t:mesh.triangles){t.v[0]=vremap[t.v[0]];t.v[1]=vremap[t.v[1]];t.v[2]=vremap[t.v[2]];}
+        for(auto& e:mesh.edges){e.first=vremap[e.first];e.second=vremap[e.second];}
+        for(auto& s:mesh.segments){s.v0=vremap[s.v0];s.v1=vremap[s.v1];}
+        for(auto& p:mesh.pbc_pairs){p.node_a=vremap[p.node_a];p.node_b=vremap[p.node_b];}
+    }
+
+    // Shift coordinates back
+    for(auto& p:mesh.vertices){ p.x+=shiftX; p.y+=shiftY; }
+
+    if(!opts.quiet)
+        std::cerr<<"Mesh: "<<mesh.vertices.size()<<" vertices, "<<mesh.triangles.size()<<" triangles\n";
+
+    outMesh = std::move(mesh);
     return 0;
 }
