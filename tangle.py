@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code Opus 4.6
 Translated from tangle.cpp
 
-Version 0.2
-17 Mar 2026
+Version 0.3
+2 May 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 

@@ -1,15 +1,16 @@
 # tangle
 
-**Version 0.2** — 17 Mar 2026
+**Version 0.3** — 2 May 2026
 
 A 2D constrained Delaunay triangulation and quality mesh generation tool,
 implemented in C++17. File format compatible with Shewchuk's
 [Triangle](https://www.cs.cmu.edu/~quake/triangle.html) with extensions
 for arc segments, local feature size constraints, and periodic boundary
-conditions.
+conditions. Also reads [FEMM](https://www.femm.info) problem files
+(`.fem`, `.fee`, `.feh`, `.fec`) directly.
 
 A Python implementation (`tangle.py`) is also included with identical
-functionality.
+functionality (`.poly`/`.node` input only).
 
 ## Authors
 
@@ -26,8 +27,14 @@ Tangle is backward-compatible with Triangle's `.node`, `.poly`, `.ele`, `.edge`,
 - **Periodic boundary conditions (PBCs)** — paired boundary chains with
   synchronized segment splitting during refinement, producing matching
   node-to-node correspondence for periodic or anti-periodic coupling.
+- **Air gap elements (AGEs)** — structured element layers across motor
+  air gaps with uniformly-spaced chord segments that are protected from
+  refinement splitting.
 - **Arc segments** — circular arcs defined by two endpoints and a
   subtended angle, automatically discretized into chord segments.
+- **Native FEMM file reading** — directly meshes `.fem`, `.fee`, `.feh`,
+  and `.fec` files, handling arc discretization, SmartMesh, boundary
+  properties, and block labels without a separate preprocessor.
 
 These extensions are described in [`polyformat.txt`](https://www.femm.info/wiki/PolyFormat),
 which documents the full extended `.poly` format.
@@ -65,9 +72,10 @@ tangle [switches] inputfile
 | `-I`   | Suppress iteration numbers on output filenames |
 | `-j`   | Jettison unused vertices from output |
 | `-P`   | Suppress .poly file output |
+| `-x`   | Write stamp file (`.tstamp`) with mesh nodes and non-segment edges |
 
-**Input:** `.node` (point set) or `.poly` (planar straight-line graph) files,
-using the same format as Triangle.
+**Input:** `.node` (point set), `.poly` (planar straight-line graph), or
+FEMM problem files (`.fem`, `.fee`, `.feh`, `.fec`).
 
 **Output:** `<base>.1.node`, `<base>.1.ele`, and optionally `.edge`, `.neigh`,
 `.poly`, `.pbc`.
@@ -165,6 +173,20 @@ This is useful for assembling finite element systems with periodic or
 anti-periodic coupling between boundaries — for example, exploiting
 rotational symmetry in electric machines, or using the Kelvin transformation
 to map unbounded exterior domains onto a finite mesh.
+
+### FEMM File Support
+
+When given a `.fem`, `.fee`, `.feh`, or `.fec` file, tangle reads the FEMM
+problem definition directly: node coordinates, line segments, arc segments
+(with automatic chord discretization), block labels (mapped to regions with
+area constraints), hole points (`<No Mesh>` blocks), and boundary properties.
+SmartMesh and per-segment `MaxSideLength` constraints are translated to LFS
+values. PBC and AGE boundary types are detected from `BdryFormat` codes and
+handled automatically.
+
+Tangle can also be compiled as a library (`-DTANGLE_AS_LIBRARY`) and linked
+into applications. The `tangle_mesh_fem()` function takes a file base name,
+runs the full meshing pipeline, and returns the mesh in memory.
 
 ### Geometric Robustness — Adaptive Exact Arithmetic
 
