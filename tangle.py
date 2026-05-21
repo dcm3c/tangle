@@ -92,6 +92,7 @@ class Options:
     neighbors: bool = False
     clean_pslg: bool = False
     clean_tol: float = -1.0  # -1 = auto (bboxDiag * 1e-6)
+    reorder: bool = False  # Cuthill-McKee bandwidth reduction
     first_index: int = 1
 
 
@@ -3007,6 +3008,8 @@ def parse_options(switch_str):
             opts.no_steiner = True
         elif c == 'n':
             opts.neighbors = True
+        elif c == 'R':
+            opts.reorder = True
         elif c == 'C':
             opts.clean_pslg = True
             num = ''
@@ -3330,17 +3333,10 @@ def main():
     if opts.pslg:
         miss = enforce_constraints(mesh, opts.quiet)
 
-        # Split long unenforced segments at their midpoint and rebuild.
+        # Split unenforced segments at their midpoint and rebuild.
         for split_round in range(10):
             if miss <= 0:
                 break
-            sum_seg_len = sum(
-                math.sqrt((mesh.vertices[s.v1].x-mesh.vertices[s.v0].x)*(mesh.vertices[s.v1].x-mesh.vertices[s.v0].x)+
-                           (mesh.vertices[s.v1].y-mesh.vertices[s.v0].y)*(mesh.vertices[s.v1].y-mesh.vertices[s.v0].y))
-                for s in mesh.segments
-            )
-            avg_seg_len = sum_seg_len / max(1, len(mesh.segments))
-            min_split_len = avg_seg_len * 2.0
 
             v2t_chk = [[] for _ in range(len(mesh.vertices))]
             for i, t in enumerate(mesh.triangles):
@@ -3353,10 +3349,7 @@ def main():
             for i, s in enumerate(mesh.segments):
                 if mesh.has_edge(s.v0, s.v1, v2t_chk):
                     continue
-                seg_len = math.sqrt((mesh.vertices[s.v1].x-mesh.vertices[s.v0].x)*(mesh.vertices[s.v1].x-mesh.vertices[s.v0].x)+
-                                     (mesh.vertices[s.v1].y-mesh.vertices[s.v0].y)*(mesh.vertices[s.v1].y-mesh.vertices[s.v0].y))
-                if seg_len >= min_split_len:
-                    to_split.append(i)
+                to_split.append(i)
             if not to_split:
                 break
 
@@ -3373,7 +3366,7 @@ def main():
                 mesh.segments.insert(si + 1, Segment(mid_idx, v1, mk, slfs, spt))
 
             if not opts.quiet:
-                print(f"  Split {len(to_split)} long unenforced segments, rebuilding...",
+                print(f"  Split {len(to_split)} unenforced segments, rebuilding...",
                       file=sys.stderr)
             mesh.triangles.clear()
             build_delaunay(mesh)
@@ -3445,6 +3438,102 @@ def main():
         for p in mesh.pbc_pairs:
             p.node_a = vremap[p.node_a]
             p.node_b = vremap[p.node_b]
+
+    # Cuthill-McKee bandwidth reduction + element sort
+    if opts.reorder:
+        nv = len(mesh.vertices)
+        ne = len(mesh.triangles)
+
+        # Build connectivity from element topology
+        numcon = [0] * nv
+        for t in mesh.triangles:
+            for j in range(3):
+                numcon[t.v[j]] += 1
+                numcon[t.v[(j+1)%3]] += 1
+
+        # Build adjacency lists
+        adj = [[] for _ in range(nv)]
+        for t in mesh.triangles:
+            for j in range(3):
+                n0, n1 = t.v[j], t.v[(j+1)%3]
+                adj[n0].append(n1)
+                adj[n1].append(n0)
+
+        # Remove duplicates and sort by connectivity
+        for i in range(nv):
+            adj[i] = sorted(set(adj[i]), key=lambda x: numcon[x])
+            numcon[i] = len(adj[i])
+
+        # Find starting node (minimum connectivity)
+        start_node = min(range(nv), key=lambda i: numcon[i])
+
+        # Cuthill-McKee renumbering
+        newnum = [-1] * nv
+        order = [-1] * nv
+        newnum[start_node] = 0
+        order[0] = start_node
+        n = 1
+        cur = 0
+        while n < nv:
+            if cur < n:
+                n0 = order[cur]
+                for nb in adj[n0]:
+                    if newnum[nb] < 0:
+                        newnum[nb] = n
+                        order[n] = nb
+                        n += 1
+                cur += 1
+            else:
+                # Multiply connected — find unvisited node with min connectivity
+                best = -1
+                for i in range(nv):
+                    if newnum[i] < 0 and (best < 0 or numcon[i] < numcon[best]):
+                        best = i
+                if best < 0:
+                    break
+                newnum[best] = n
+                order[n] = best
+                n += 1
+
+        # Apply renumbering to elements
+        for t in mesh.triangles:
+            t.v = [newnum[t.v[0]], newnum[t.v[1]], newnum[t.v[2]]]
+        mesh.edges = [(newnum[a], newnum[b]) for a, b in mesh.edges]
+        for s in mesh.segments:
+            s.v0, s.v1 = newnum[s.v0], newnum[s.v1]
+        for p in mesh.pbc_pairs:
+            p.node_a, p.node_b = newnum[p.node_a], newnum[p.node_b]
+
+        # Reorder vertex array in-place
+        for i in range(nv):
+            while newnum[i] != i:
+                j = newnum[i]
+                newnum[i], newnum[j] = newnum[j], newnum[i]
+                mesh.vertices[i], mesh.vertices[j] = mesh.vertices[j], mesh.vertices[i]
+
+        # Sort elements by vertex sum (comb sort)
+        score = [t.v[0] + t.v[1] + t.v[2] for t in mesh.triangles]
+        gap = ne
+        swapped = True
+        while gap > 1 or swapped:
+            gap = max(1, (gap * 10) // 13)
+            if gap in (9, 10):
+                gap = 11
+            swapped = False
+            for i in range(ne - gap):
+                if score[i] > score[i + gap]:
+                    score[i], score[i + gap] = score[i + gap], score[i]
+                    mesh.triangles[i], mesh.triangles[i + gap] = mesh.triangles[i + gap], mesh.triangles[i]
+                    swapped = True
+
+        if not opts.quiet:
+            bw = 0
+            for t in mesh.triangles:
+                for j in range(3):
+                    d = abs(t.v[j] - t.v[(j+1)%3])
+                    if d > bw:
+                        bw = d
+            print(f"  Cuthill-McKee: bandwidth={bw+1}", file=sys.stderr)
 
     if not opts.quiet:
         print(f"Output: {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles",
