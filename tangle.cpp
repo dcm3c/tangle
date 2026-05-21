@@ -6,11 +6,11 @@
 // Generated with the assistance of Claude Code Opus 4.6
 //
 // Version 0.3
-// 2 May 2026
+// 02 May 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
-// Build: g++ -O3 -std=c++17 -o tangle tangle.cpp float256.cpp -lm
+// Build: g++ -O3 -std=c++17 -static -o tangle tangle.cpp float256.cpp -lm
 //
 // File format compatibility:
 //   .node  - vertex files
@@ -115,6 +115,7 @@ struct Options {
     bool clean_pslg    = false;
     double clean_tol   = -1.0;  // -1 = auto (bboxDiag * CLOSE_ENOUGH)
     bool no_lfs_output = false; // suppress LFS column in .node output (for FEMM solver)
+    bool reorder       = false; // Cuthill-McKee bandwidth reduction
     int  first_index   = 1;
 };
 
@@ -408,7 +409,6 @@ void buildDelaunay(Mesh& mesh){
     for(int ii=0; ii<n; ii++){
         int pidx = order[ii];
         const Point& p = pts[pidx];
-
         // Locate containing triangle by walking
         int startTri = -1;
         {
@@ -3431,7 +3431,7 @@ bool readFemFile(const std::string& filename,
         double altMaxSideLength=(360.0/M_PI)*(info.ro-info.ri)/(info.ro+info.ri);
         if(altMaxSideLength<myMaxSideLength) myMaxSideLength=altMaxSideLength;
         // Round to 1 significant digit (matching FEMM's sprintf kludge for consistency)
-        {char buf[32]; sprintf(buf,"%.1e",myMaxSideLength); sscanf(buf,"%lf",&myMaxSideLength);}
+        {char buf[32]; snprintf(buf, sizeof(buf),"%.1e",myMaxSideLength); sscanf(buf,"%lf",&myMaxSideLength);}
         // Apply to all arcs in this AGE
         for(int ai:info.arcIndices)
             arcs[ai].maxSideLength=myMaxSideLength;
@@ -3664,6 +3664,7 @@ bool readFemFile(const std::string& filename,
     // ----- Set options to match FEMM's Triangle invocation -----
     opts.pslg=true;
     opts.clean_pslg=true; // enforce PSLG in case Lua scripts bypassed GUI's EnforcePSLG
+    opts.reorder=true;   // Cuthill-McKee bandwidth reduction for solvers
     opts.quality=true;
     opts.min_angle=std::min(minAngle, MINANGLE_MAX_VAL);
     opts.edges=true;
@@ -3924,6 +3925,7 @@ Options parseOptions(const std::string& switchStr){
             case 'Y': opts.no_steiner=true; break;
             case 'n': opts.neighbors=true; break;
             case 'x': opts.stamp=true; break;
+            case 'R': opts.reorder=true; break;
             case 'C':
                 opts.clean_pslg=true;
                 if(i<(int)switchStr.size()&&(std::isdigit(switchStr[i])||switchStr[i]=='.')){
@@ -4153,11 +4155,267 @@ void printUsage(){
 "  -I    Suppress iteration numbers on output file names.\n"
 "  -Y    No Steiner points on boundary segments.\n"
 "  -n    Output .neigh file.\n"
+"  -R    Reorder nodes (Cuthill-McKee bandwidth reduction).\n"
 "  -C    Clean PSLG: merge near-duplicate nodes, split intersecting\n"
 "        segments, remove duplicates. Optional tolerance (e.g. -C0.001);\n"
 "        default is bounding-box diagonal * 1e-6.\n"
 "\n"
 "Input: .node or .poly files. Output: .1.node .1.ele [.1.edge] [.1.neigh] [.1.poly]\n";
+}
+
+// ============================================================
+// Shared meshing pipeline: cleanPSLG → Delaunay → CDT → holes →
+// PBC → regions → quality → cleanup → jettison
+// Used by both main() and tangle_mesh_fem().
+// ============================================================
+
+static void runMeshPipeline(Mesh& mesh, const Options& opts)
+{
+    // Shift coordinates to near the origin to maximize floating-point precision.
+    double shiftX=0, shiftY=0;
+    if(!mesh.vertices.empty()){
+        double minX=mesh.vertices[0].x, maxX=minX, minY=mesh.vertices[0].y, maxY=minY;
+        for(auto& p:mesh.vertices){ minX=std::min(minX,p.x); maxX=std::max(maxX,p.x); minY=std::min(minY,p.y); maxY=std::max(maxY,p.y); }
+        shiftX=(minX+maxX)*0.5; shiftY=(minY+maxY)*0.5;
+        for(auto& p:mesh.vertices){ p.x-=shiftX; p.y-=shiftY; }
+        for(auto& h:mesh.holes){ h.x-=shiftX; h.y-=shiftY; }
+        for(auto& r:mesh.regions){ r.x-=shiftX; r.y-=shiftY; }
+    }
+
+    // 0. Optional PSLG cleanup
+    if(opts.clean_pslg && opts.pslg)
+        cleanPSLG(mesh, opts.clean_tol, opts.quiet);
+
+    // 1. Delaunay triangulation
+    buildDelaunay(mesh);
+    if(!opts.quiet) std::cerr<<"Initial Delaunay: "<<mesh.triangles.size()<<" triangles\n";
+
+    // 2. Enforce PSLG segments (CDT)
+    mesh.rebuildAdjacency();
+    if(opts.pslg){
+        int miss = enforceConstraints(mesh, opts.quiet);
+
+        // Split unenforced segments at their midpoint and rebuild.
+        for(int splitRound=0; splitRound<10 && miss>0; splitRound++){
+            std::vector<std::vector<int>> v2t(mesh.vertices.size());
+            for(int i=0;i<(int)mesh.triangles.size();i++){
+                auto& t=mesh.triangles[i]; if(t.v[0]<0) continue;
+                for(int j=0;j<3;j++) v2t[t.v[j]].push_back(i);
+            }
+            std::vector<int> toSplit;
+            for(int i=0;i<(int)mesh.segments.size();i++){
+                if(mesh.hasEdge(mesh.segments[i].v0,mesh.segments[i].v1,v2t)) continue;
+                toSplit.push_back(i);
+            }
+            if(toSplit.empty()) break;
+
+            for(int ii=(int)toSplit.size()-1; ii>=0; ii--){
+                int si=toSplit[ii];
+                auto& seg=mesh.segments[si];
+                double mx=(mesh.vertices[seg.v0].x+mesh.vertices[seg.v1].x)/2;
+                double my=(mesh.vertices[seg.v0].y+mesh.vertices[seg.v1].y)/2;
+                int bm=std::max(mesh.vertices[seg.v0].marker,
+                                mesh.vertices[seg.v1].marker);
+                int midIdx=(int)mesh.vertices.size();
+                mesh.vertices.push_back({mx,my,midIdx,bm,{}});
+                int v0=seg.v0, v1=seg.v1, mk=seg.marker;
+                double slfs=seg.lfs; int spt=seg.pbc_type;
+                mesh.segments[si]={v0,midIdx,mk,slfs,spt};
+                mesh.segments.insert(mesh.segments.begin()+si+1,{midIdx,v1,mk,slfs,spt});
+            }
+            if(!opts.quiet)
+                std::cerr<<"  Split "<<(int)toSplit.size()<<" unenforced segments, rebuilding...\n";
+
+            mesh.triangles.clear();
+            buildDelaunay(mesh);
+            mesh.rebuildAdjacency();
+            miss = enforceConstraints(mesh, opts.quiet);
+        }
+    }
+
+    // 3. Remove holes via flood fill
+    if(opts.pslg) removeHoles(mesh, opts);
+
+    // 3b. Build PBC twin map from CDT orientation
+    buildPbcTwinFromCDT(mesh);
+
+    // 4. Assign regions via flood fill
+    if(opts.regions) assignRegions(mesh, opts);
+
+    int nInputVerts = (int)mesh.vertices.size();
+
+    // 5. Quality refinement
+    if(opts.quality||opts.area_limit) refineQuality(mesh, opts, nInputVerts);
+
+    // 6. Final cleanup: compact dead triangles, rebuild adjacency, extract edges
+    {
+        std::vector<Triangle> live;
+        for(auto& t:mesh.triangles) if(t.v[0]>=0) live.push_back(t);
+        mesh.triangles=live;
+    }
+    mesh.rebuildAdjacency();
+    extractEdges(mesh);
+
+    // 7. Convert PBC twin map to output pairs
+    {
+        std::set<std::pair<int,int>> seen;
+        for(auto& [a, b] : mesh.pbc_twin){
+            if(a==b) continue;
+            auto key=std::make_pair(std::min(a,b), std::max(a,b));
+            if(seen.insert(key).second){
+                int type=mesh.pbc_node_type.count(a)?mesh.pbc_node_type[a]:0;
+                mesh.pbc_pairs.push_back({a, b, type});
+            }
+        }
+    }
+
+    // 8. Jettison unused vertices
+    if(opts.jettison){
+        std::vector<bool> used(mesh.vertices.size(),false);
+        for(auto& t:mesh.triangles){used[t.v[0]]=used[t.v[1]]=used[t.v[2]]=true;}
+        std::vector<int> vremap(mesh.vertices.size(),-1);
+        std::vector<Point> newPts;
+        for(int i=0;i<(int)mesh.vertices.size();i++)
+            if(used[i]){vremap[i]=(int)newPts.size();newPts.push_back(mesh.vertices[i]);}
+        mesh.vertices=newPts;
+        for(auto& t:mesh.triangles){t.v[0]=vremap[t.v[0]];t.v[1]=vremap[t.v[1]];t.v[2]=vremap[t.v[2]];}
+        for(auto& e:mesh.edges){e.first=vremap[e.first];e.second=vremap[e.second];}
+        for(auto& s:mesh.segments){s.v0=vremap[s.v0];s.v1=vremap[s.v1];}
+        for(auto& p:mesh.pbc_pairs){p.node_a=vremap[p.node_a];p.node_b=vremap[p.node_b];}
+    }
+
+    // 9. Cuthill-McKee bandwidth reduction + element sort by region
+    if(opts.reorder){
+        int nv=(int)mesh.vertices.size();
+        int ne=(int)mesh.triangles.size();
+
+        // Build connectivity from element topology
+        std::vector<int> numcon(nv, 0);
+        int totalEdges=0;
+        for(auto& t:mesh.triangles)
+            for(int j=0;j<3;j++){
+                numcon[t.v[j]]++;
+                numcon[t.v[(j+1)%3]]++;
+                totalEdges++;
+            }
+
+        // Allocate and fill adjacency lists
+        std::vector<int> conStorage(2*totalEdges);
+        std::vector<int*> ocon(nv);
+        std::vector<int> nxtnum(nv, 0);
+        for(int i=0,offset=0;i<nv;i++){
+            ocon[i]=conStorage.data()+offset;
+            offset+=numcon[i];
+        }
+        for(auto& t:mesh.triangles)
+            for(int j=0;j<3;j++){
+                int n0=t.v[j], n1=t.v[(j+1)%3];
+                ocon[n0][nxtnum[n0]++]=n1;
+                ocon[n1][nxtnum[n1]++]=n0;
+            }
+
+        // Remove duplicate connections
+        for(int i=0;i<nv;i++){
+            std::sort(ocon[i], ocon[i]+numcon[i]);
+            int k=0;
+            for(int j=0;j<numcon[i];j++)
+                if(j==0||ocon[i][j]!=ocon[i][j-1]) ocon[i][k++]=ocon[i][j];
+            numcon[i]=k;
+        }
+
+        // Sort each adjacency list by connectivity (ascending)
+        for(int i=0;i<nv;i++)
+            std::sort(ocon[i], ocon[i]+numcon[i], [&](int a, int b){
+                return numcon[a]<numcon[b];
+            });
+
+        // Find starting node (minimum connectivity)
+        int startNode=0;
+        for(int i=1;i<nv;i++)
+            if(numcon[i]<numcon[startNode]) startNode=i;
+
+        // Cuthill-McKee renumbering
+        std::vector<int> newnum(nv, -1);
+        std::vector<int> order(nv, -1);
+        newnum[startNode]=0; order[0]=startNode;
+        int n=1, cur=0;
+        while(n<nv){
+            if(cur<n){
+                int n0=order[cur];
+                for(int i=0;i<numcon[n0];i++){
+                    if(newnum[ocon[n0][i]]<0){
+                        newnum[ocon[n0][i]]=n;
+                        order[n]=ocon[n0][i];
+                        n++;
+                    }
+                }
+                cur++;
+            } else {
+                // Multiply connected — find unvisited node with min connectivity
+                int best=-1;
+                for(int i=0;i<nv;i++)
+                    if(newnum[i]<0 && (best<0||numcon[i]<numcon[best])) best=i;
+                if(best<0) break;
+                newnum[best]=n; order[n]=best; n++;
+            }
+        }
+
+        // Apply renumbering to elements
+        for(auto& t:mesh.triangles)
+            for(int j=0;j<3;j++) t.v[j]=newnum[t.v[j]];
+        for(auto& e:mesh.edges){ e.first=newnum[e.first]; e.second=newnum[e.second]; }
+        for(auto& s:mesh.segments){ s.v0=newnum[s.v0]; s.v1=newnum[s.v1]; }
+        for(auto& p:mesh.pbc_pairs){ p.node_a=newnum[p.node_a]; p.node_b=newnum[p.node_b]; }
+        for(auto& age:mesh.age_defs){
+            for(auto& nd:age.innerNodes) nd=newnum[nd];
+            for(auto& nd:age.outerNodes) nd=newnum[nd];
+        }
+
+        // Reorder vertex array in-place
+        for(int i=0;i<nv;i++)
+            while(newnum[i]!=i){
+                int j=newnum[i];
+                std::swap(newnum[i], newnum[j]);
+                std::swap(mesh.vertices[i], mesh.vertices[j]);
+            }
+
+        // Sort elements by region (comb sort)
+        {
+            std::vector<int> score(ne);
+            for(int i=0;i<ne;i++)
+                score[i]=mesh.triangles[i].v[0]+mesh.triangles[i].v[1]+mesh.triangles[i].v[2];
+            int gap=ne;
+            bool swapped;
+            do{
+                if(gap>1) gap=(gap*10)/13;
+                if(gap==9||gap==10) gap=11;
+                swapped=false;
+                for(int i=0;i+gap<ne;i++)
+                    if(score[i]>score[i+gap]){
+                        std::swap(score[i],score[i+gap]);
+                        std::swap(mesh.triangles[i],mesh.triangles[i+gap]);
+                        swapped=true;
+                    }
+            }while(gap>1||swapped);
+        }
+
+        if(!opts.quiet){
+            // Compute bandwidth
+            int bw=0;
+            for(auto& t:mesh.triangles)
+                for(int j=0;j<3;j++){
+                    int d=std::abs(t.v[j]-t.v[(j+1)%3]);
+                    if(d>bw) bw=d;
+                }
+            std::cerr<<"  Cuthill-McKee: bandwidth="<<bw+1<<"\n";
+        }
+    }
+
+    // Shift coordinates back to original position
+    for(auto& p:mesh.vertices){ p.x+=shiftX; p.y+=shiftY; }
+
+    if(!opts.quiet)
+        std::cerr<<"Output: "<<mesh.vertices.size()<<" vertices, "<<mesh.triangles.size()<<" triangles\n";
 }
 
 #ifndef TANGLE_AS_LIBRARY
@@ -4205,19 +4463,6 @@ int main(int argc, char* argv[]){
         if(!readNodeFile(inputFile,mesh.vertices,nAttribs,nMarkers)) return 1;
     }
 
-    // Shift coordinates to near the origin to maximize floating-point precision.
-    // Large coordinate offsets (e.g. x≈100000) cause orient2d/inCircle to lose
-    // significant digits; centering on the bbox midpoint eliminates this.
-    double shiftX=0, shiftY=0;
-    if(!mesh.vertices.empty()){
-        double minX=mesh.vertices[0].x, maxX=minX, minY=mesh.vertices[0].y, maxY=minY;
-        for(auto& p:mesh.vertices){ minX=std::min(minX,p.x); maxX=std::max(maxX,p.x); minY=std::min(minY,p.y); maxY=std::max(maxY,p.y); }
-        shiftX=(minX+maxX)*0.5; shiftY=(minY+maxY)*0.5;
-        for(auto& p:mesh.vertices){ p.x-=shiftX; p.y-=shiftY; }
-        for(auto& h:mesh.holes){ h.x-=shiftX; h.y-=shiftY; }
-        for(auto& r:mesh.regions){ r.x-=shiftX; r.y-=shiftY; }
-    }
-
     if(!opts.quiet){
         std::cerr<<"Input: "<<mesh.vertices.size()<<" vertices";
         if(!mesh.segments.empty()) std::cerr<<", "<<mesh.segments.size()<<" segments";
@@ -4226,158 +4471,7 @@ int main(int argc, char* argv[]){
         std::cerr<<"\n";
     }
 
-    auto tStart = std::chrono::high_resolution_clock::now();
-    auto tPrev = tStart;
-    auto elapsed = [&]() {
-        auto now = std::chrono::high_resolution_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(now - tPrev).count();
-        tPrev = now;
-        return ms;
-    };
-
-    // 0. Optional PSLG cleanup
-    if(opts.clean_pslg && opts.pslg){
-        cleanPSLG(mesh, opts.clean_tol, opts.quiet);
-        if(!opts.quiet) std::cerr<<"  PSLG cleanup: "<<elapsed()<<" ms\n";
-    }
-
-    // 1. Delaunay triangulation
-    buildDelaunay(mesh);
-    if(!opts.quiet) std::cerr<<"Initial Delaunay: "<<mesh.triangles.size()<<" triangles ("<<elapsed()<<" ms)\n";
-
-    // 2. Enforce PSLG segments (CDT)
-    mesh.rebuildAdjacency();
-    if(opts.pslg){
-        int miss = enforceConstraints(mesh, opts.quiet);
-
-        // Split long unenforced segments at their midpoint and rebuild.
-        // Only splits segments longer than a threshold; short segments that
-        // fail are a robustness issue that splitting won't fix.
-        for(int splitRound=0; splitRound<10 && miss>0; splitRound++){
-            // Compute average segment length as a split threshold.
-            // Only split segments significantly longer than the average
-            // constrained segment, since splitting short failing segments
-            // indicates a robustness issue rather than a length issue.
-            double sumSegLen=0;
-            for(auto& s:mesh.segments){
-                auto& a=mesh.vertices[s.v0]; auto& b=mesh.vertices[s.v1];
-                sumSegLen+=std::sqrt((b.x-a.x)*(b.x-a.x) + (b.y-a.y)*(b.y-a.y));
-            }
-            double avgSegLen = sumSegLen / std::max(1,(int)mesh.segments.size());
-            double minSplitLen = avgSegLen * 2.0;
-
-            std::vector<std::vector<int>> v2t(mesh.vertices.size());
-            for(int i=0;i<(int)mesh.triangles.size();i++){
-                auto& t=mesh.triangles[i]; if(t.v[0]<0) continue;
-                for(int j=0;j<3;j++) v2t[t.v[j]].push_back(i);
-            }
-            std::vector<int> toSplit;
-            for(int i=0;i<(int)mesh.segments.size();i++){
-                if(mesh.hasEdge(mesh.segments[i].v0,mesh.segments[i].v1,v2t)) continue;
-                auto& a=mesh.vertices[mesh.segments[i].v0];
-                auto& b=mesh.vertices[mesh.segments[i].v1];
-                if(std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y)) >= minSplitLen)
-                    toSplit.push_back(i);
-            }
-            if(toSplit.empty()) break;
-
-            int nSplit=0;
-            for(int ii=(int)toSplit.size()-1; ii>=0; ii--){
-                int si=toSplit[ii];
-                auto& seg=mesh.segments[si];
-                double mx=(mesh.vertices[seg.v0].x+mesh.vertices[seg.v1].x)/2;
-                double my=(mesh.vertices[seg.v0].y+mesh.vertices[seg.v1].y)/2;
-                int bm = std::max(mesh.vertices[seg.v0].marker,
-                                  mesh.vertices[seg.v1].marker);
-                int midIdx=(int)mesh.vertices.size();
-                mesh.vertices.push_back({mx, my, midIdx, bm, {}});
-
-                int v0=seg.v0, v1=seg.v1, mk=seg.marker;
-                double slfs=seg.lfs; int spt=seg.pbc_type;
-                mesh.segments[si] = {v0, midIdx, mk, slfs, spt};
-                mesh.segments.insert(mesh.segments.begin()+si+1, {midIdx, v1, mk, slfs, spt});
-                nSplit++;
-            }
-            if(!opts.quiet)
-                std::cerr<<"  Split "<<nSplit<<" long unenforced segments, rebuilding...\n";
-
-            mesh.triangles.clear();
-            buildDelaunay(mesh);
-            mesh.rebuildAdjacency();
-            miss = enforceConstraints(mesh, opts.quiet);
-        }
-    }
-    if(!opts.quiet) std::cerr<<"  CDT: "<<elapsed()<<" ms\n";
-
-    // 3. Remove holes via flood fill
-    if(opts.pslg) removeHoles(mesh, opts);
-    if(!opts.quiet) std::cerr<<"  Holes: "<<elapsed()<<" ms\n";
-
-    // 3b. Build PBC twin map from CDT orientation.
-    // Must run AFTER removeHoles: PBC segments are exterior edges, so
-    // after hole removal each has exactly one adjacent (interior) triangle.
-    // This gives unambiguous, consistent orientation for all PBC segments.
-    buildPbcTwinFromCDT(mesh);
-
-    // 4. Assign regions via flood fill on the coarse mesh
-    if(opts.regions) assignRegions(mesh, opts);
-    if(!opts.quiet) std::cerr<<"  Regions: "<<elapsed()<<" ms\n";
-
-    // Note: region-0 triangles (gaps between domains) are kept in the mesh
-    // during refinement to preserve topology. They are removed after refinement.
-
-    int nInputVerts = (int)mesh.vertices.size();
-
-    // 5. Quality refinement (new triangles inherit regions from containing triangle)
-    if(opts.quality||opts.area_limit) refineQuality(mesh, opts, nInputVerts);
-    if(!opts.quiet) std::cerr<<"  Refinement: "<<elapsed()<<" ms\n";
-
-    // 7. Final cleanup: compact dead triangles, rebuild adjacency, extract edges
-    {
-        std::vector<Triangle> live;
-        for(auto& t:mesh.triangles) if(t.v[0]>=0) live.push_back(t);
-        mesh.triangles=live;
-    }
-    mesh.rebuildAdjacency();
-    extractEdges(mesh);
-    if(!opts.quiet) std::cerr<<"  Cleanup+edges: "<<elapsed()<<" ms\n";
-
-    // ---- Convert PBC twin map to output pairs ----
-    // The twin map was populated after reading .fem file (initial PBC node pairs)
-    // and extended by synchronized segment splits during quality refinement.
-    // Each entry appears twice (a→b and b→a); output each pair once.
-    {
-        std::set<std::pair<int,int>> seen;
-        for(auto& [a, b] : mesh.pbc_twin){
-            if(a==b) continue;
-            auto key=std::make_pair(std::min(a,b), std::max(a,b));
-            if(seen.insert(key).second){
-                int type=mesh.pbc_node_type.count(a)?mesh.pbc_node_type[a]:0;
-                mesh.pbc_pairs.push_back({a, b, type});
-            }
-        }
-    }
-
-    if(opts.jettison){
-        std::vector<bool> used(mesh.vertices.size(),false);
-        for(auto& t:mesh.triangles){used[t.v[0]]=used[t.v[1]]=used[t.v[2]]=true;}
-        std::vector<int> vremap(mesh.vertices.size(),-1);
-        std::vector<Point> newPts;
-        for(int i=0;i<(int)mesh.vertices.size();i++){
-            if(used[i]){vremap[i]=(int)newPts.size();newPts.push_back(mesh.vertices[i]);}
-        }
-        mesh.vertices=newPts;
-        for(auto& t:mesh.triangles){t.v[0]=vremap[t.v[0]];t.v[1]=vremap[t.v[1]];t.v[2]=vremap[t.v[2]];}
-        for(auto& e:mesh.edges){e.first=vremap[e.first];e.second=vremap[e.second];}
-        for(auto& s:mesh.segments){s.v0=vremap[s.v0];s.v1=vremap[s.v1];}
-        for(auto& p:mesh.pbc_pairs){p.node_a=vremap[p.node_a];p.node_b=vremap[p.node_b];}
-    }
-
-    if(!opts.quiet)
-        std::cerr<<"Output: "<<mesh.vertices.size()<<" vertices, "<<mesh.triangles.size()<<" triangles\n";
-
-    // Shift coordinates back to original position for output
-    for(auto& p:mesh.vertices){ p.x+=shiftX; p.y+=shiftY; }
+    runMeshPipeline(mesh, opts);
 
     std::string outBase=base+(opts.suppress_iter?"":".1");
     writeNodeFile(outBase+".node",mesh.vertices,nAttribs,nMarkers>0||opts.pslg,opts);
@@ -4464,17 +4558,6 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
 
     opts.quiet = true;  // suppress meshing diagnostics when called as library
 
-    // Coordinate shift for numerical precision
-    double shiftX=0, shiftY=0;
-    if(!mesh.vertices.empty()){
-        double minX=mesh.vertices[0].x, maxX=minX, minY=mesh.vertices[0].y, maxY=minY;
-        for(auto& p:mesh.vertices){ minX=std::min(minX,p.x); maxX=std::max(maxX,p.x); minY=std::min(minY,p.y); maxY=std::max(maxY,p.y); }
-        shiftX=(minX+maxX)*0.5; shiftY=(minY+maxY)*0.5;
-        for(auto& p:mesh.vertices){ p.x-=shiftX; p.y-=shiftY; }
-        for(auto& h:mesh.holes){ h.x-=shiftX; h.y-=shiftY; }
-        for(auto& r:mesh.regions){ r.x-=shiftX; r.y-=shiftY; }
-    }
-
     if(!opts.quiet){
         std::cerr<<"Input: "<<mesh.vertices.size()<<" vertices";
         if(!mesh.segments.empty()) std::cerr<<", "<<mesh.segments.size()<<" segments";
@@ -4482,100 +4565,7 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
         std::cerr<<"\n";
     }
 
-    // Full meshing pipeline
-    if(opts.clean_pslg && opts.pslg) cleanPSLG(mesh, opts.clean_tol, opts.quiet);
-    buildDelaunay(mesh);
-    mesh.rebuildAdjacency();
-    if(opts.pslg){
-        int miss = enforceConstraints(mesh, opts.quiet);
-        for(int splitRound=0; splitRound<10 && miss>0; splitRound++){
-            double sumSegLen=0;
-            for(auto& s:mesh.segments){
-                auto& a=mesh.vertices[s.v0]; auto& b=mesh.vertices[s.v1];
-                sumSegLen+=std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y));
-            }
-            double avgSegLen = sumSegLen / std::max(1,(int)mesh.segments.size());
-            double minSplitLen = avgSegLen * 2.0;
-            std::vector<std::vector<int>> v2t(mesh.vertices.size());
-            for(int i=0;i<(int)mesh.triangles.size();i++){
-                auto& t=mesh.triangles[i]; if(t.v[0]<0) continue;
-                for(int j=0;j<3;j++) v2t[t.v[j]].push_back(i);
-            }
-            std::vector<int> toSplit;
-            for(int i=0;i<(int)mesh.segments.size();i++){
-                if(mesh.hasEdge(mesh.segments[i].v0,mesh.segments[i].v1,v2t)) continue;
-                auto& a=mesh.vertices[mesh.segments[i].v0];
-                auto& b=mesh.vertices[mesh.segments[i].v1];
-                if(std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y)) >= minSplitLen)
-                    toSplit.push_back(i);
-            }
-            if(toSplit.empty()) break;
-            for(int ii=(int)toSplit.size()-1; ii>=0; ii--){
-                int si=toSplit[ii]; auto& seg=mesh.segments[si];
-                double mx=(mesh.vertices[seg.v0].x+mesh.vertices[seg.v1].x)/2;
-                double my=(mesh.vertices[seg.v0].y+mesh.vertices[seg.v1].y)/2;
-                int bm=std::max(mesh.vertices[seg.v0].marker,mesh.vertices[seg.v1].marker);
-                int midIdx=(int)mesh.vertices.size();
-                mesh.vertices.push_back({mx,my,midIdx,bm,{}});
-                int v0=seg.v0, v1=seg.v1, mk=seg.marker;
-                double slfs=seg.lfs; int spt=seg.pbc_type;
-                mesh.segments[si]={v0,midIdx,mk,slfs,spt};
-                mesh.segments.insert(mesh.segments.begin()+si+1,{midIdx,v1,mk,slfs,spt});
-            }
-            mesh.triangles.clear();
-            buildDelaunay(mesh);
-            mesh.rebuildAdjacency();
-            miss = enforceConstraints(mesh, opts.quiet);
-        }
-    }
-    if(opts.pslg) removeHoles(mesh, opts);
-    buildPbcTwinFromCDT(mesh);
-    if(opts.regions) assignRegions(mesh, opts);
-    int nInputVerts = (int)mesh.vertices.size();
-    if(opts.quality||opts.area_limit) refineQuality(mesh, opts, nInputVerts);
-
-    // Final cleanup
-    {
-        std::vector<Triangle> live;
-        for(auto& t:mesh.triangles) if(t.v[0]>=0) live.push_back(t);
-        mesh.triangles=live;
-    }
-    mesh.rebuildAdjacency();
-    extractEdges(mesh);
-
-    // Build PBC output pairs
-    {
-        std::set<std::pair<int,int>> seen;
-        for(auto& [a, b] : mesh.pbc_twin){
-            if(a==b) continue;
-            auto key=std::make_pair(std::min(a,b), std::max(a,b));
-            if(seen.insert(key).second){
-                int type=mesh.pbc_node_type.count(a)?mesh.pbc_node_type[a]:0;
-                mesh.pbc_pairs.push_back({a, b, type});
-            }
-        }
-    }
-
-    // Jettison unused vertices
-    {
-        std::vector<bool> used(mesh.vertices.size(),false);
-        for(auto& t:mesh.triangles){used[t.v[0]]=used[t.v[1]]=used[t.v[2]]=true;}
-        std::vector<int> vremap(mesh.vertices.size(),-1);
-        std::vector<Point> newPts;
-        for(int i=0;i<(int)mesh.vertices.size();i++)
-            if(used[i]){vremap[i]=(int)newPts.size();newPts.push_back(mesh.vertices[i]);}
-        mesh.vertices=newPts;
-        for(auto& t:mesh.triangles){t.v[0]=vremap[t.v[0]];t.v[1]=vremap[t.v[1]];t.v[2]=vremap[t.v[2]];}
-        for(auto& e:mesh.edges){e.first=vremap[e.first];e.second=vremap[e.second];}
-        for(auto& s:mesh.segments){s.v0=vremap[s.v0];s.v1=vremap[s.v1];}
-        for(auto& p:mesh.pbc_pairs){p.node_a=vremap[p.node_a];p.node_b=vremap[p.node_b];}
-    }
-
-    // Shift coordinates back
-    for(auto& p:mesh.vertices){ p.x+=shiftX; p.y+=shiftY; }
-
-    if(!opts.quiet)
-        std::cerr<<"Mesh: "<<mesh.vertices.size()<<" vertices, "<<mesh.triangles.size()<<" triangles\n";
+    runMeshPipeline(mesh, opts);
 
     outMesh = std::move(mesh);
     return 0;
