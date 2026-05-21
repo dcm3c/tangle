@@ -189,6 +189,27 @@ Tangle can also be compiled as a library (`-DTANGLE_AS_LIBRARY`) and linked
 into applications. The `tangle_mesh_fem()` function takes a file base name,
 runs the full meshing pipeline, and returns the mesh in memory.
 
+### Node Reordering — Cuthill-McKee Algorithm
+
+When the `-R` flag is given (or automatically for FEMM files), tangle
+reorders the mesh nodes using the
+[Cuthill-McKee algorithm](https://en.wikipedia.org/wiki/Cuthill%E2%80%93McKee_algorithm)
+([Cuthill & McKee 1969](https://doi.org/10.1145/800195.805928)) to reduce
+the bandwidth of the resulting finite element stiffness matrix.
+
+The algorithm builds a node adjacency graph from the element topology, then
+performs a breadth-first traversal starting from the node with minimum
+connectivity. At each step, unvisited neighbors are appended in order of
+ascending connectivity (degree), which tends to keep nearby nodes close
+together in the new numbering. Disconnected components are handled by
+restarting the BFS from the lowest-connectivity unvisited node.
+
+After renumbering, elements are sorted by the sum of their vertex indices
+(using comb sort) so that elements sharing nodes are stored adjacently.
+Together, these two reorderings improve cache locality and reduce the
+bandwidth of sparse matrix storage formats used by direct and iterative FEM
+solvers.
+
 ### Geometric Robustness — Adaptive Exact Arithmetic
 
 The geometric predicates `orient2d` (point-line orientation) and `inCircle` (point-in-circumcircle) use a floating-point filter with exact arithmetic fallback. Each predicate first evaluates a fast double-precision (~53-bit) computation, then checks the result against [a forward error bound derived from the operand magnitudes](https://www.femm.info/wiki/PredicateBounds) ([Higham 2002](https://www.google.com/books/edition/Accuracy_and_Stability_of_Numerical_Algo/epilvM5MMxwC)). When the result is too close to zero relative to the bound to determine the sign reliably, the computation falls back to extended-precision arithmetic for an exact answer.
