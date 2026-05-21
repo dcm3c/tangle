@@ -72,6 +72,7 @@ tangle [switches] inputfile
 | `-I`   | Suppress iteration numbers on output filenames |
 | `-j`   | Jettison unused vertices from output |
 | `-P`   | Suppress .poly file output |
+| `-R`   | Reorder nodes (Cuthill-McKee bandwidth reduction) |
 | `-x`   | Write stamp file (`.tstamp`) with mesh nodes and non-segment edges |
 
 **Input:** `.node` (point set), `.poly` (planar straight-line graph), or
