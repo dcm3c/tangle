@@ -84,11 +84,19 @@ def read_poly(fn):
         ndim = int(parts[1]) if len(parts) > 1 else 2
         n_attr = int(parts[2]) if len(parts) > 2 else 0
         has_mark = int(parts[3]) if len(parts) > 3 else 0
-        for _ in range(nv):
-            parts = next_data_line(f).split()
-            idx = int(parts[0])
-            x, y = float(parts[1]), float(parts[2])
-            verts[idx] = (x, y)
+        if nv == 0:
+            # Triangle convention: 0 vertices means the coordinates live in the
+            # companion .node file (tangle writes its output .poly this way).
+            node_fn = fn[:-5] + '.node' if fn.endswith('.poly') else fn + '.node'
+            if os.path.exists(node_fn):
+                for idx, (vx, vy, _m) in read_node(node_fn).items():
+                    verts[idx] = (vx, vy)
+        else:
+            for _ in range(nv):
+                parts = next_data_line(f).split()
+                idx = int(parts[0])
+                x, y = float(parts[1]), float(parts[2])
+                verts[idx] = (x, y)
         # Segments
         parts = next_data_line(f).split()
         ns = int(parts[0])

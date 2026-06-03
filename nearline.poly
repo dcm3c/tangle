@@ -1,0 +1,17 @@
+# Square (-1,0)-(1,0)-(1,2)-(-1,2) with one interior point at (0,1e-5),
+# 1e-5 above the bottom edge: a "point very close to a line" stress case.
+# nodes: count dim attrs markers
+5 2 0 1
+1  -1  0  1
+2   1  0  1
+3   1  2  1
+4  -1  2  1
+5   0  1e-5  0
+# segments: count markers
+4 1
+1  1 2  1
+2  2 3  1
+3  3 4  1
+4  4 1  1
+# holes
+0

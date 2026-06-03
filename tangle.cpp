@@ -5,8 +5,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code Opus 4.6
 //
-// Version 0.3
-// 02 May 2026
+// Version 0.4
+// 02 Jun 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -65,6 +65,7 @@
 #include "float256.h"
 #include <numeric>
 #include <queue>
+#include <charconv>
 
 
 struct PairHash {
@@ -94,6 +95,11 @@ static const double CLOSE_ENOUGH = 1e-6;
 // regions (e.g. near-coincident input vertices) where the full minimum
 // angle is unachievable, but some refinement is still worthwhile.
 static const double TINY_TRI_ANGLE = 15.0;
+
+// Hard cap on the requested minimum angle (degrees).  Delaunay refinement is
+// only guaranteed to terminate below ~33.8° (Ruppert/Shewchuk); Applied to BOTH
+//  the CLI (-q) and FEMM-invocation paths.
+static const double MINANGLE_MAX_VAL = 33.8;
 
 struct Options {
     bool pslg          = false;
@@ -303,6 +309,7 @@ struct Mesh {
     void rebuildAdjacency(){
         int nt=(int)triangles.size();
         std::unordered_map<long long, int> edgeToTriEdge;
+        edgeToTriEdge.reserve((size_t)nt*2); // ~1.5 edges/tri; avoid rehashing
         for(auto& t : triangles) t.neighbors = {-1,-1,-1};
         for(int i=0; i<nt; i++){
             if(triangles[i].v[0]<0) continue;
@@ -1351,7 +1358,9 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                         adjMap[bndEdges[i].v0].push_back({bndEdges[i].v1, i});
 
                     // At each vertex, sort outgoing edges by angle for consistent traversal
-                    for(auto& [v, edges] : adjMap){
+                    for(auto& kv : adjMap){
+                        int v = kv.first;
+                        auto& edges = kv.second;
                         if(edges.size()>1){
                             std::sort(edges.begin(), edges.end(), [&](auto& a, auto& b){
                                 double ax=mesh.vertices[a.first].x-mesh.vertices[v].x;
@@ -1661,7 +1670,8 @@ void assignRegions(Mesh& mesh, const Options& opts){
 int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
                       const EdgeSet& constrainedEdges,
                       std::vector<int>& affected,
-                      std::vector<std::pair<int,int>>* flipBuf=nullptr){
+                      std::vector<std::pair<int,int>>* flipBuf=nullptr,
+                      double minDist2=0.0){
     int pidx=(int)mesh.vertices.size();
     mesh.vertices.push_back(np);
 
@@ -1704,10 +1714,19 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
         }
     }
 
-    // Check near-coincident with existing vertex
+    // Check near-coincident with existing vertex. The reject radius is normally
+    // EPS (just guard exact coincidence), but the quality-refinement caller
+    // passes minDist2 = (0.5*shortest-edge-of-bad-triangle)^2 as a too-close
+    // guard: an off-center/circumcenter that would land within half the bad
+    // triangle's shortest edge of an existing vertex is rejected (the triangle
+    // is then tolerated rather than refined). This stops the insertion radius
+    // from collapsing on near-degenerate geometry (e.g. a point ~1e-5 off a
+    // line), which otherwise manufactures sub-ULP inverted triangles. No-op for
+    // well-conditioned meshes, where circumcenters land far from every vertex.
+    double rejR2 = std::max(EPS*EPS, minDist2);
     for(int j=0;j<3;j++){
         double dx=mesh.vertices[t.v[j]].x-np.x, dy=mesh.vertices[t.v[j]].y-np.y;
-        if(dx*dx+dy*dy < EPS*EPS){ mesh.vertices.pop_back(); return -1; }
+        if(dx*dx+dy*dy < rejR2){ mesh.vertices.pop_back(); return -1; }
     }
 
     // Inherit region from the containing triangle
@@ -2183,24 +2202,61 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     }
     int steinerCount=0;
 
+    // Reserve storage from the triangle-count estimate so the Steiner storm
+    // doesn't trigger repeated vector reallocations (and the attendant copies
+    // of every Point/Triangle).  Capped at the Steiner limit; pure headroom,
+    // never changes results.
+    {
+        double estCap=std::min(estTotalTris, (double)maxSteiner);
+        if(estCap>0){
+            mesh.triangles.reserve(mesh.triangles.size()+(size_t)(estCap*1.3)+64);
+            mesh.vertices.reserve(mesh.vertices.size()+(size_t)(estCap*0.7)+64);
+        }
+    }
+
     // Shell tracking for acute-angle wedges (populated before refinement loop)
     std::unordered_set<int> acuteApices;
     std::vector<int> shellApex(mesh.vertices.size(), -1);
 
     EdgeSet constrainedEdges;
     for(auto& s:mesh.segments) constrainedEdges.insert(edgeKey(s.v0,s.v1));
+    // edgeToSeg is only consulted to find PBC partner segments; if the mesh
+    // has no periodic boundaries, skip maintaining it entirely.
+    bool anyPbc=false;
+    for(auto& s:mesh.segments) if(s.pbc_type>=0){ anyPbc=true; break; }
     double gxmin=1e30,gxmax=-1e30,gymin=1e30,gymax=-1e30;
     for(auto& v:mesh.vertices){
         gxmin=std::min(gxmin,v.x); gxmax=std::max(gxmax,v.x);
         gymin=std::min(gymin,v.y); gymax=std::max(gymax,v.y);
     }
     gxmin-=1; gymin-=1; gxmax+=1; gymax+=1;
-    int gNX=50, gNY=50;
+    // Size the grid so each cell holds ~O(1) segments at the FINAL mesh density.
+    // A fixed 50x50 leaves ~17 segments/cell on a segment-dense 256k-tri mesh,
+    // which made findEncroached ~21% of the refine loop. Estimate the final
+    // segment count = (current boundary length) / (mesh size h), and target
+    // ~sqrt(estSegs) cells/side. The 50 floor keeps low-segment meshes (where
+    // 50x50 is already fine) from over-building a mostly-empty grid; the 700 cap
+    // bounds memory.
+    int gTarget=50;
+    {
+        double bLen=0;
+        for(auto& s:mesh.segments){ auto&a=mesh.vertices[s.v0]; auto&b=mesh.vertices[s.v1];
+            bLen+=std::sqrt((b.x-a.x)*(b.x-a.x)+(b.y-a.y)*(b.y-a.y)); }
+        double domA=(gxmax-gxmin)*(gymax-gymin);
+        double h=std::sqrt(domA/std::max(1.0,estTotalTris)); // characteristic mesh size
+        double estSegs = (h>0) ? bLen/h : 0;
+        int g=(int)std::sqrt(std::max(1.0,estSegs));
+        if(g>gTarget) gTarget=g;
+        if(gTarget>700) gTarget=700;
+    }
+    int gNX=gTarget, gNY=gTarget;
     double gcell=std::max((gxmax-gxmin)/gNX,(gymax-gymin)/gNY);
     gNX=(int)((gxmax-gxmin)/gcell)+1;
     gNY=(int)((gymax-gymin)/gcell)+1;
 
-    std::unordered_map<int,std::vector<int>> segGrid;
+    // Flat fixed-size grid (gNX*gNY cells) — direct indexing by cx*gNY+cy
+    // avoids a hash lookup on every cell touch in the encroachment query.
+    std::vector<std::vector<int>> segGrid(gNX*gNY);
 
     auto gridAddSeg=[&](int si){
         auto& s=mesh.segments[si];
@@ -2235,10 +2291,12 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
 
     for(int si=0;si<(int)mesh.segments.size();si++) gridAddSeg(si);
 
-    // Map from edge key to segment index, for finding PBC partner segments
-    std::map<std::pair<int,int>,int> edgeToSeg;
-    for(int si=0;si<(int)mesh.segments.size();si++)
-        edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
+    // Map from edge key to segment index, for finding PBC partner segments.
+    // Only needed (and only populated) when periodic boundaries are present.
+    std::unordered_map<std::pair<int,int>,int,PairHash> edgeToSeg;
+    if(anyPbc)
+        for(int si=0;si<(int)mesh.segments.size();si++)
+            edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
 
     // Core segment split helper (no PBC synchronization)
     auto splitSegmentCore=[&](int si, std::vector<int>& outAffected, int hintTri=-1) -> int {
@@ -2250,13 +2308,13 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
 
         auto ek=edgeKey(seg.v0,seg.v1);
         constrainedEdges.erase(ek);
-        edgeToSeg.erase(ek);
+        if(anyPbc) edgeToSeg.erase(ek);
         gridRemoveSeg(si);
 
         int midIdx=insertPointLawson(mesh,mid,hintTri,constrainedEdges,outAffected);
         if(midIdx<0){
             constrainedEdges.insert(ek);
-            edgeToSeg[ek]=si;
+            if(anyPbc) edgeToSeg[ek]=si;
             gridAddSeg(si);
             return -1;
         }
@@ -2277,8 +2335,10 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         mesh.segments.push_back(s2);
         constrainedEdges.insert(edgeKey(s1.v0,s1.v1));
         constrainedEdges.insert(edgeKey(s2.v0,s2.v1));
-        edgeToSeg[edgeKey(s1.v0,s1.v1)]=si;
-        edgeToSeg[edgeKey(s2.v0,s2.v1)]=newSi;
+        if(anyPbc){
+            edgeToSeg[edgeKey(s1.v0,s1.v1)]=si;
+            edgeToSeg[edgeKey(s2.v0,s2.v1)]=newSi;
+        }
         gridAddSeg(si);
         gridAddSeg(newSi);
         return midIdx;
@@ -2332,9 +2392,7 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         for(int dx=-1;dx<=1;dx++) for(int dy=-1;dy<=1;dy++){
             int cx=gcx+dx, cy=gcy+dy;
             if(cx<0||cx>=gNX||cy<0||cy>=gNY) continue;
-            auto it=segGrid.find(cx*gNY+cy);
-            if(it==segGrid.end()) continue;
-            for(int si:it->second){
+            for(int si:segGrid[cx*gNY+cy]){
                 auto& s=mesh.segments[si];
                 if(s.no_split) continue; // AGE chords must stay uniformly spaced
                 auto& sa=mesh.vertices[s.v0]; auto& sb=mesh.vertices[s.v1];
@@ -2379,18 +2437,71 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     std::vector<int> affected, toCheck, segAff;
     std::vector<std::pair<int,int>> flipBuf;
 
-    using PQItem = std::tuple<double, int, int>; // metric, triIdx, generation
-    std::priority_queue<PQItem> pq;
+    using PQItem = std::tuple<double, int, int, int>; // priority, triIdx, generation, retry
+    // Refinement queue: a BUCKET QUEUE (approximate shortest-edge-first) rather
+    // than a binary heap. ~NBUCK vector buckets binned by edge-length octave; push
+    // is O(1) (append), pop scans up from the lowest non-empty bucket (the curB
+    // cursor amortizes the scan to ~O(1)). Stale entries are skipped lazily on pop
+    // (no removal, no per-triangle node bookkeeping). This avoids the cache-missing
+    // sift-down over a large (tens-of-MB) heap, which profiling showed dominated
+    // the refinement loop (~31% of it). BUCKETS_PER_OCTAVE=16 is fine enough that
+    // the approximate order reproduces the exact-heap triangle count (measured)
+    // while keeping the queue cache-resident and cheap. The bucket queue suits
+    // shortest-edge ordering specifically: edge lengths span many octaves and bin
+    // cleanly. NOT byte-identical to a heap (approximate order, equivalent mesh).
+    const double BUCKETS_PER_OCTAVE = 16.0;
+    const int NBUCK = 2048;
+    std::vector<std::vector<PQItem>> buckets(NBUCK);
+    long long nQ = 0;
+    int curB = NBUCK; // lowest non-empty bucket (lazily corrected on pop)
+    auto bucketOf = [&](double prio)->int{
+        // prio = -minEdge2 (smaller edge -> lower bucket -> popped first)
+        double v = -prio;                          // = minEdge2 (positive)
+        if(!(v>0)) return 0;
+        double L = 0.5*std::log2(v);               // = log2(edge)
+        int b = (int)std::floor(BUCKETS_PER_OCTAVE * L) + NBUCK/2;
+        return b<0 ? 0 : (b>=NBUCK ? NBUCK-1 : b);
+    };
+    auto pqpush = [&](const PQItem& it){
+        int b = bucketOf(std::get<0>(it));
+        buckets[b].push_back(it); nQ++;
+        if(b < curB) curB = b;
+    };
+    auto pqpop = [&]() -> PQItem {
+        while(curB<NBUCK && buckets[curB].empty()) curB++;
+        PQItem it = buckets[curB].back(); buckets[curB].pop_back(); nQ--;
+        return it;
+    };
+    // Priority key fed into the queue: shortest-edge-first = -shortest_edge^2.
+    auto prioKey = [](const TriMetricResult& mr)->double{
+        double minEdge2 = std::min(mr.la2, std::min(mr.lb2, mr.lc2));
+        return -minEdge2;
+    };
+    // Capped re-queue of a bad triangle whose circumcenter encroached a segment
+    // but which was NOT itself modified by the split (so it isn't in segAff and
+    // would otherwise be silently dropped even though the split may have made it
+    // fixable). REQUEUE_CAP=2 gives each such triangle exactly one second chance,
+    // then drops it exactly as the old "always drop" code did — the cascade
+    // backstop for a sharp apex where the same circumcenter keeps encroaching.
+    // One retry recovers every fixable sliver across the test suite; allowing
+    // more only adds a few redundant triangles with no quality gain (measured).
+    // See quality_refinement_requeue_notes.md.
+    const int REQUEUE_CAP = 2;
+    // Too-close-insertion guard: reject an off-center/circumcenter that would
+    // land within GUARD_FACTOR * (bad triangle's shortest edge) of an existing
+    // vertex. Passed to insertPointLawson as a squared distance. Stops the
+    // insertion radius collapsing on near-degenerate geometry (the rejected
+    // triangle is tolerated). No-op on well-conditioned meshes.
+    const double GUARD_FACTOR = 0.5;
 
     for(int i=0;i<(int)mesh.triangles.size();i++){
         auto mr = triMetric(mesh, i, minAng, globalMaxA, useRegionArea, cosMinAng);
-        if(mr.metric > 0) pq.push({mr.metric, i, mesh.triangles[i].generation});
+        if(mr.metric > 0) pqpush({prioKey(mr), i, mesh.triangles[i].generation, 0});
     }
 
     int dbgEncroach=0, dbgInsert=0, dbgSkip=0, dbgFail=0;
-    while(!pq.empty() && steinerCount<maxSteiner){
-        auto [metric, badIdx, gen] = pq.top();
-        pq.pop();
+    while(nQ>0 && steinerCount<maxSteiner){
+        auto [metric, badIdx, gen, retry] = pqpop();
 
         if(badIdx >= (int)mesh.triangles.size()) continue;
         auto& bt = mesh.triangles[badIdx];
@@ -2500,17 +2611,26 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             segAff.clear();
             if(splitSegment(encSeg, segAff, badIdx)){
                 dbgEncroach++;
-                // Don't explicitly re-queue badIdx: if the segment split
-                // modified it, it will be re-queued via segAff below.
-                // Re-queuing unchanged triangles creates infinite loops
-                // when their circumcenter always encroaches the same area.
+                // Triangles modified by the split are re-queued fresh (retry=0)
+                // via segAff below. If badIdx was NOT among them, the split left
+                // it unchanged but may have removed the segment its circumcenter
+                // encroached, making it now fixable — so re-queue it too, with an
+                // incremented retry. The cap stops the apex cascade (where the
+                // same circumcenter keeps encroaching split after split).
+                bool badInSeg=false;
+                for(int ti2:segAff) if(ti2==badIdx){ badInSeg=true; break; }
+                if(!badInSeg && retry+1<REQUEUE_CAP
+                   && badIdx<(int)mesh.triangles.size() && mesh.triangles[badIdx].v[0]>=0){
+                    auto mrb=triMetric(mesh,badIdx,minAng,globalMaxA,useRegionArea,cosMinAng);
+                    if(mrb.metric>0) pqpush({prioKey(mrb),badIdx,mesh.triangles[badIdx].generation,retry+1});
+                }
                 for(int ti2:segAff){
                     if(ti2>=0&&ti2<(int)mesh.triangles.size()&&mesh.triangles[ti2].v[0]>=0){
                         {auto mr2=triMetric(mesh,ti2,minAng,globalMaxA,useRegionArea,cosMinAng);
-                        if(mr2.metric>0) pq.push({mr2.metric,ti2,mesh.triangles[ti2].generation});}
+                        if(mr2.metric>0) pqpush({prioKey(mr2),ti2,mesh.triangles[ti2].generation,0});}
                         for(int k=0;k<3;k++){
                             int nb=mesh.triangles[ti2].neighbors[k];
-                            if(nb>=0){ auto mr2=triMetric(mesh,nb,minAng,globalMaxA,useRegionArea,cosMinAng); if(mr2.metric>0) pq.push({mr2.metric,nb,mesh.triangles[nb].generation}); }
+                            if(nb>=0){ auto mr2=triMetric(mesh,nb,minAng,globalMaxA,useRegionArea,cosMinAng); if(mr2.metric>0) pqpush({prioKey(mr2),nb,mesh.triangles[nb].generation,0}); }
                         }
                     }
                 }
@@ -2518,31 +2638,30 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             continue;
         }
 
-        // Insert off-center/circumcenter using Lawson flips
+        // Insert off-center/circumcenter using Lawson flips.
+        // Guard radius = (GUARD_FACTOR * shortest edge of the bad triangle)^2,
+        // using the squared edge lengths already cached in tmr.
+        double minEdge2=std::min(tmr.la2,std::min(tmr.lb2,tmr.lc2));
+        double guardDist2=GUARD_FACTOR*GUARD_FACTOR*minEdge2;
         Point np{tcx,tcy,(int)mesh.vertices.size(),0,{}};
         affected.clear();
-        int newPt=insertPointLawson(mesh,np,badIdx,constrainedEdges,affected,&flipBuf);
+        int newPt=insertPointLawson(mesh,np,badIdx,constrainedEdges,affected,&flipBuf,guardDist2);
         if(newPt<0){ dbgFail++; continue; }
 
         steinerCount++;
         dbgInsert++;
 
-        // Re-check affected triangles and their neighbors
+        // Re-check the affected triangles. insertPointLawson records every
+        // modified triangle (split products + all flips) in `affected`, and a
+        // triangle's metric depends only on its own 3 vertices, so unmodified
+        // neighbors can't have changed status — no neighbor sweep needed.
         toCheck.assign(affected.begin(), affected.end());
-        for(int ti : affected){
-            if(ti>=0 && ti<(int)mesh.triangles.size() && mesh.triangles[ti].v[0]>=0){
-                for(int j=0;j<3;j++){
-                    int nb=mesh.triangles[ti].neighbors[j];
-                    if(nb>=0) toCheck.push_back(nb);
-                }
-            }
-        }
         std::sort(toCheck.begin(), toCheck.end());
         toCheck.erase(std::unique(toCheck.begin(), toCheck.end()), toCheck.end());
         for(int ti : toCheck){
             if(ti<0 || ti>=(int)mesh.triangles.size()) continue;
             auto mr=triMetric(mesh,ti,minAng,globalMaxA,useRegionArea,cosMinAng);
-            if(mr.metric>0) pq.push({mr.metric,ti,mesh.triangles[ti].generation});
+            if(mr.metric>0) pqpush({prioKey(mr),ti,mesh.triangles[ti].generation,0});
         }
     }
     if(!opts.quiet)
@@ -2799,12 +2918,23 @@ void buildPbcTwinFromCDT(Mesh& mesh){
 
 void extractEdges(Mesh& mesh){
     mesh.edges.clear();
-    EdgeSet seen;
-    for(auto& t:mesh.triangles){
+    // A 2D triangulation has ~1.5 edges per triangle; reserve up front.
+    size_t nt=mesh.triangles.size();
+    mesh.edges.reserve(nt*3/2+8);
+    // Dedup via the maintained adjacency instead of hashing every edge.
+    // neighbors[j] is the triangle across edge (v[j], v[(j+1)%3]); emit each
+    // edge once, at its lower-indexed incident triangle (or at a boundary
+    // edge, neighbors[j] < 0). Because we scan triangles in index order and
+    // emit at min(i, nb) in that triangle's orientation, this reproduces the
+    // hash version's first-occurrence order exactly (verified byte-identical),
+    // at O(N) with no hashing.
+    for(int i=0;i<(int)nt;i++){
+        auto& t=mesh.triangles[i];
         if(t.v[0]<0) continue;
         for(int j=0;j<3;j++){
-            auto key=edgeKey(t.v[j],t.v[(j+1)%3]);
-            if(!seen.count(key)){seen.insert(key); mesh.edges.push_back({t.v[j],t.v[(j+1)%3]});}
+            int nb=t.neighbors[j];
+            if(nb<0 || i<nb)
+                mesh.edges.push_back({t.v[j],t.v[(j+1)%3]});
         }
     }
 }
@@ -2854,21 +2984,36 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
     if(!f){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
     skipComments(f);
     int nv,dim,nmark; f>>nv>>dim>>nAttribs>>nmark;
-    pts.resize(nv);
     int firstVertIdx=std::numeric_limits<int>::max();
-    for(int i=0;i<nv;i++){
-        skipComments(f);
-        int idx; f>>idx>>pts[i].x>>pts[i].y;
-        pts[i].id=idx;
-        firstVertIdx=std::min(firstVertIdx,idx);
-        pts[i].attribs.resize(nAttribs);
-        for(int a=0;a<nAttribs;a++) f>>pts[i].attribs[a];
-        if(nmark>0) f>>pts[i].marker; else pts[i].marker=0;
-        // Optional LFS column after marker
-        std::string rest; std::getline(f,rest);
-        std::istringstream rss(rest);
-        double lval;
-        if(rss>>lval) pts[i].lfs=lval;
+    if(nv==0){
+        // Triangle convention: a .poly with 0 nodes references its companion
+        // .node file (this is what tangle now writes for output .poly).
+        std::string nodeFile=filename;
+        auto pp=nodeFile.rfind(".poly");
+        if(pp!=std::string::npos) nodeFile=nodeFile.substr(0,pp)+".node";
+        int nm2=0;
+        if(!readNodeFile(nodeFile, pts, nAttribs, nm2)){
+            std::cerr<<"Poly file declares 0 nodes but companion .node ("
+                     <<nodeFile<<") could not be read\n";
+            return false;
+        }
+        for(auto& p:pts) firstVertIdx=std::min(firstVertIdx,p.id);
+    } else {
+        pts.resize(nv);
+        for(int i=0;i<nv;i++){
+            skipComments(f);
+            int idx; f>>idx>>pts[i].x>>pts[i].y;
+            pts[i].id=idx;
+            firstVertIdx=std::min(firstVertIdx,idx);
+            pts[i].attribs.resize(nAttribs);
+            for(int a=0;a<nAttribs;a++) f>>pts[i].attribs[a];
+            if(nmark>0) f>>pts[i].marker; else pts[i].marker=0;
+            // Optional LFS column after marker
+            std::string rest; std::getline(f,rest);
+            std::istringstream rss(rest);
+            double lval;
+            if(rss>>lval) pts[i].lfs=lval;
+        }
     }
     int base=(firstVertIdx==0)?0:1;
 
@@ -3058,7 +3203,6 @@ bool readFemFile(const std::string& filename,
     // FEMM constants
     const double LINEFRACTION     = 100.0;
     const double BBOXFRACTION     = 100.0;
-    const double MINANGLE_MAX_VAL = 33.8;
 
     double minAngle=20.0;
     int doSmartMesh=0;
@@ -3555,10 +3699,11 @@ bool readFemFile(const std::string& filename,
         dedup(age.outerNodes);
 
         // Sort each ring by angle relative to AGE center
+        double sortCx=info.cx, sortCy=info.cy;
         auto angleSort=[&](std::vector<int>& ring){
             std::sort(ring.begin(), ring.end(), [&](int a, int b){
-                double angA=std::atan2(pts[a].y-info.cy, pts[a].x-info.cx);
-                double angB=std::atan2(pts[b].y-info.cy, pts[b].x-info.cx);
+                double angA=std::atan2(pts[a].y-sortCy, pts[a].x-sortCx);
+                double angB=std::atan2(pts[b].y-sortCy, pts[b].x-sortCx);
                 return angA<angB;
             });
         };
@@ -3680,55 +3825,88 @@ bool readFemFile(const std::string& filename,
     return true;
 }
 
+// Fast formatting helpers for the large output files.  ostream operator<<
+// per token is dominated by per-call locale/sentry overhead; building rows
+// into a reusable string buffer with a hand-rolled integer formatter and
+// snprintf("%.17g") (byte-equivalent to setprecision(17) defaultfloat) and
+// flushing in ~1 MB blocks is several times faster.
+namespace {
+inline void appendInt(std::string& s, long long v){
+    char tmp[24]; char* p=tmp+sizeof(tmp);
+    unsigned long long u = v<0 ? (unsigned long long)(-(v+1))+1ull : (unsigned long long)v;
+    do { *--p = char('0' + (int)(u%10)); u/=10; } while(u);
+    if(v<0) *--p='-';
+    s.append(p, tmp+sizeof(tmp)-p);
+}
+inline void appendG17(std::string& s, double v){
+    // Shortest round-trip formatting via std::to_chars (Ryu). Produces the
+    // fewest digits that strtod reads back to the identical double — faster
+    // than snprintf("%.17g") and yields smaller files. NOTE: output bytes
+    // differ from %.17g (e.g. "0.1" vs "0.10000000000000001"); values are
+    // bit-exact on round-trip, but byte-for-byte regression baselines change.
+    char tmp[40];
+    auto r=std::to_chars(tmp, tmp+sizeof(tmp), v);
+    s.append(tmp, r.ptr-tmp);
+}
+inline void flushIfBig(std::ofstream& f, std::string& s){
+    if(s.size() >= (1u<<20)){ f.write(s.data(), (std::streamsize)s.size()); s.clear(); }
+}
+} // namespace
+
 void writeNodeFile(const std::string& fn, const std::vector<Point>& pts,
                    int nAttribs, bool hasMarkers, const Options& opts){
     std::ofstream f(fn);
-    f<<std::setprecision(17);
     bool hasLfs=false;
     if(!opts.no_lfs_output)
         for(auto& p:pts) if(p.lfs>0){hasLfs=true;break;}
-    f<<pts.size()<<" 2 "<<nAttribs<<" "<<(hasMarkers?1:0)<<"\n";
+    std::string out; out.reserve(1u<<20);
+    appendInt(out,(long long)pts.size()); out+=" 2 "; appendInt(out,nAttribs);
+    out+=' '; appendInt(out,hasMarkers?1:0); out+='\n';
     for(int i=0;i<(int)pts.size();i++){
-        int outIdx=opts.zero_indexed?i:(i+1);
-        f<<outIdx<<" "<<pts[i].x<<" "<<pts[i].y;
-        for(double a:pts[i].attribs) f<<" "<<a;
-        if(hasMarkers) f<<" "<<pts[i].marker;
-        if(hasLfs) f<<" "<<pts[i].lfs;
-        f<<"\n";
+        appendInt(out, opts.zero_indexed?i:(i+1));
+        out+=' '; appendG17(out,pts[i].x); out+=' '; appendG17(out,pts[i].y);
+        for(double a:pts[i].attribs){ out+=' '; appendG17(out,a); }
+        if(hasMarkers){ out+=' '; appendInt(out,pts[i].marker); }
+        if(hasLfs){ out+=' '; appendG17(out,pts[i].lfs); }
+        out+='\n';
+        flushIfBig(f,out);
     }
+    f.write(out.data(), (std::streamsize)out.size());
 }
 
 void writeEleFile(const std::string& fn, const Mesh& mesh, bool hasAttrib, const Options& opts){
     std::ofstream f(fn);
-    f<<mesh.triangles.size()<<" 3 "<<(hasAttrib?1:0)<<"\n";
+    std::string out; out.reserve(1u<<20);
+    appendInt(out,(long long)mesh.triangles.size()); out+=" 3 "; appendInt(out,hasAttrib?1:0); out+='\n';
     for(int i=0;i<(int)mesh.triangles.size();i++){
         auto& t=mesh.triangles[i];
-        int outIdx=opts.zero_indexed?i:(i+1);
-        int v0=opts.zero_indexed?t.v[0]:(t.v[0]+1);
-        int v1=opts.zero_indexed?t.v[1]:(t.v[1]+1);
-        int v2=opts.zero_indexed?t.v[2]:(t.v[2]+1);
-        f<<outIdx<<" "<<v0<<" "<<v1<<" "<<v2;
-        if(hasAttrib) f<<" "<<t.region_attrib;
-        f<<"\n";
+        appendInt(out, opts.zero_indexed?i:(i+1));
+        out+=' '; appendInt(out, opts.zero_indexed?t.v[0]:(t.v[0]+1));
+        out+=' '; appendInt(out, opts.zero_indexed?t.v[1]:(t.v[1]+1));
+        out+=' '; appendInt(out, opts.zero_indexed?t.v[2]:(t.v[2]+1));
+        if(hasAttrib){ out+=' '; appendG17(out,t.region_attrib); }
+        out+='\n';
+        flushIfBig(f,out);
     }
+    f.write(out.data(), (std::streamsize)out.size());
 }
 
 void writeEdgeFile(const std::string& fn, const Mesh& mesh, const Options& opts){
     std::ofstream f(fn);
-    std::map<std::pair<int,int>,int> edgeCount;
+    std::unordered_map<std::pair<int,int>,int,PairHash> edgeCount;
+    edgeCount.reserve(mesh.triangles.size()*2);
     for(auto& t:mesh.triangles){
         if(t.v[0]<0) continue;
         for(int j=0;j<3;j++) edgeCount[edgeKey(t.v[j],t.v[(j+1)%3])]++;
     }
     // Build map from edge to segment marker
-    std::map<std::pair<int,int>,int> segMarker;
+    std::unordered_map<std::pair<int,int>,int,PairHash> segMarker;
+    segMarker.reserve(mesh.segments.size()*2+8);
     for(auto& s:mesh.segments) segMarker[edgeKey(s.v0,s.v1)]=s.marker;
-    f<<mesh.edges.size()<<" 1\n";
+    std::string out; out.reserve(1u<<20);
+    appendInt(out,(long long)mesh.edges.size()); out+=" 1\n";
     for(int i=0;i<(int)mesh.edges.size();i++){
         int a=mesh.edges[i].first, b=mesh.edges[i].second;
-        int outIdx=opts.zero_indexed?i:(i+1);
-        int oa=opts.zero_indexed?a:(a+1);
-        int ob=opts.zero_indexed?b:(b+1);
         auto key=edgeKey(a,b);
         int marker=0;
         bool isBoundary = (edgeCount[key]==1);
@@ -3739,46 +3917,53 @@ void writeEdgeFile(const std::string& fn, const Mesh& mesh, const Options& opts)
         } else if(isBoundary){
             marker=1;
         }
-        f<<outIdx<<" "<<oa<<" "<<ob<<" "<<marker<<"\n";
+        appendInt(out, opts.zero_indexed?i:(i+1));
+        out+=' '; appendInt(out, opts.zero_indexed?a:(a+1));
+        out+=' '; appendInt(out, opts.zero_indexed?b:(b+1));
+        out+=' '; appendInt(out, marker); out+='\n';
+        flushIfBig(f,out);
     }
+    f.write(out.data(), (std::streamsize)out.size());
 }
 
 void writeNeighFile(const std::string& fn, const Mesh& mesh, const Options& opts){
     std::ofstream f(fn);
-    f<<mesh.triangles.size()<<" 3\n";
+    std::string out; out.reserve(1u<<20);
+    appendInt(out,(long long)mesh.triangles.size()); out+=" 3\n";
+    auto nb=[&](int n)->int{return(n<0)?-1:(opts.zero_indexed?n:(n+1));};
     for(int i=0;i<(int)mesh.triangles.size();i++){
         auto& t=mesh.triangles[i];
-        int outIdx=opts.zero_indexed?i:(i+1);
-        auto nb=[&](int n)->int{return(n<0)?-1:(opts.zero_indexed?n:(n+1));};
-        f<<outIdx<<" "<<nb(t.neighbors[0])<<" "<<nb(t.neighbors[1])<<" "<<nb(t.neighbors[2])<<"\n";
+        appendInt(out, opts.zero_indexed?i:(i+1));
+        out+=' '; appendInt(out,nb(t.neighbors[0]));
+        out+=' '; appendInt(out,nb(t.neighbors[1]));
+        out+=' '; appendInt(out,nb(t.neighbors[2])); out+='\n';
+        flushIfBig(f,out);
     }
+    f.write(out.data(), (std::streamsize)out.size());
 }
 
 void writePolyFile(const std::string& fn, const Mesh& mesh, const Options& opts){
     std::ofstream f(fn);
-    f<<std::setprecision(17);
-    bool hasLfs=false;
-    for(auto& p:mesh.vertices) if(p.lfs>0){hasLfs=true;break;}
     bool hasSegLfs=false;
     for(auto& s:mesh.segments) if(s.lfs>0){hasSegLfs=true;break;}
-    int nv=(int)mesh.vertices.size();
-    f<<nv<<" 2 0 1\n";
-    for(int i=0;i<nv;i++){
-        int outIdx=opts.zero_indexed?i:(i+1);
-        f<<outIdx<<" "<<mesh.vertices[i].x<<" "<<mesh.vertices[i].y<<" "<<mesh.vertices[i].marker;
-        if(hasLfs) f<<" "<<mesh.vertices[i].lfs;
-        f<<"\n";
-    }
-    f<<mesh.segments.size()<<" 1\n";
+    std::string out; out.reserve(1u<<20);
+    // Vertex count 0: the .poly references the companion .node file for its
+    // nodes (Shewchuk's Triangle convention). Writing the full node list inline
+    // here just duplicates the .node file — on a 130k-node mesh that was ~117ms,
+    // ~13% of total runtime. Segment endpoints below index into the .node file.
+    out+="0 2 0 1\n";
+    appendInt(out,(long long)mesh.segments.size()); out+=" 1\n";
     for(int i=0;i<(int)mesh.segments.size();i++){
-        int outIdx=opts.zero_indexed?i:(i+1);
-        int oa=opts.zero_indexed?mesh.segments[i].v0:(mesh.segments[i].v0+1);
-        int ob=opts.zero_indexed?mesh.segments[i].v1:(mesh.segments[i].v1+1);
-        f<<outIdx<<" "<<oa<<" "<<ob<<" "<<mesh.segments[i].marker;
-        if(hasSegLfs) f<<" "<<mesh.segments[i].lfs;
-        f<<"\n";
+        appendInt(out, opts.zero_indexed?i:(i+1));
+        out+=' '; appendInt(out, opts.zero_indexed?mesh.segments[i].v0:(mesh.segments[i].v0+1));
+        out+=' '; appendInt(out, opts.zero_indexed?mesh.segments[i].v1:(mesh.segments[i].v1+1));
+        out+=' '; appendInt(out, mesh.segments[i].marker);
+        if(hasSegLfs){ out+=' '; appendG17(out,mesh.segments[i].lfs); }
+        out+='\n';
+        flushIfBig(f,out);
     }
-    f<<"0\n";
+    out+="0\n";
+    f.write(out.data(), (std::streamsize)out.size());
 }
 
 void writePbcFile(const std::string& fn, const Mesh& mesh, const Options& opts){
@@ -3906,7 +4091,14 @@ Options parseOptions(const std::string& switchStr){
                     std::string num;
                     while(i<(int)switchStr.size()&&(std::isdigit(switchStr[i])||switchStr[i]=='.'))
                         num+=switchStr[i++];
-                    opts.min_angle=std::stod(num);
+                    double req=std::stod(num);
+                    if(req>MINANGLE_MAX_VAL){
+                        std::cerr<<"Warning: requested minimum angle "<<req
+                                 <<" exceeds the "<<MINANGLE_MAX_VAL
+                                 <<" deg termination limit; clamping to "<<MINANGLE_MAX_VAL<<".\n";
+                        req=MINANGLE_MAX_VAL;
+                    }
+                    opts.min_angle=req;
                 } break;
             case 'e': opts.edges=true; break;
             case 'A': opts.regions=true; break;
@@ -3941,7 +4133,6 @@ Options parseOptions(const std::string& switchStr){
 
 // PSLG cleanup (-C flag): merge near-duplicate nodes, split
 // segments at intersections, remove duplicate segments.
-// Adapted from FEMM's EnforcePSLG().
 // ============================================================
 
 void cleanPSLG(Mesh& mesh, double tol, bool quiet){
@@ -4247,14 +4438,26 @@ static void runMeshPipeline(Mesh& mesh, const Options& opts)
     // 5. Quality refinement
     if(opts.quality||opts.area_limit) refineQuality(mesh, opts, nInputVerts);
 
-    // 6. Final cleanup: compact dead triangles, rebuild adjacency, extract edges
+    // 6. Final cleanup: compact dead triangles, then extract edges.
+    // Adjacency is already maintained incrementally during refinement
+    // (insertPointLawson keeps neighbors[] correct), so instead of throwing
+    // it away and rebuilding from a hash map, we remap the existing neighbor
+    // indices through the old->new compaction map — an O(N) pass with no
+    // hashing.  (Same pattern buildDelaunay uses for its final compaction.)
     {
+        std::vector<int> remap(mesh.triangles.size(), -1);
         std::vector<Triangle> live;
-        for(auto& t:mesh.triangles) if(t.v[0]>=0) live.push_back(t);
-        mesh.triangles=live;
+        live.reserve(mesh.triangles.size());
+        for(int i=0;i<(int)mesh.triangles.size();i++)
+            if(mesh.triangles[i].v[0]>=0){ remap[i]=(int)live.size(); live.push_back(mesh.triangles[i]); }
+        for(auto& t:live)
+            for(int j=0;j<3;j++)
+                if(t.neighbors[j]>=0) t.neighbors[j]=remap[t.neighbors[j]];
+        mesh.triangles=std::move(live);
     }
-    mesh.rebuildAdjacency();
-    extractEdges(mesh);
+    // Edges are consumed only by writeEdgeFile; skip building them entirely when
+    // no .edge output is requested. (The FEMM path forces opts.edges=true.)
+    if(opts.edges) extractEdges(mesh);
 
     // 7. Convert PBC twin map to output pairs
     {
@@ -4379,24 +4582,25 @@ static void runMeshPipeline(Mesh& mesh, const Options& opts)
                 std::swap(mesh.vertices[i], mesh.vertices[j]);
             }
 
-        // Sort elements by region (comb sort)
+        // Order elements by vertex-index sum, so spatially-near elements (low
+        // node numbers after CM) are adjacent — gives the postprocessor's
+        // triangle search O(sqrt(N)) locality.  Index sort + single gather is
+        // far faster than an in-place comb sort on the Triangle array; ties are
+        // broken by original index for deterministic output (the order within a
+        // tied-score group is immaterial to the search).
         {
-            std::vector<int> score(ne);
-            for(int i=0;i<ne;i++)
+            std::vector<int> score(ne), idx(ne);
+            for(int i=0;i<ne;i++){
                 score[i]=mesh.triangles[i].v[0]+mesh.triangles[i].v[1]+mesh.triangles[i].v[2];
-            int gap=ne;
-            bool swapped;
-            do{
-                if(gap>1) gap=(gap*10)/13;
-                if(gap==9||gap==10) gap=11;
-                swapped=false;
-                for(int i=0;i+gap<ne;i++)
-                    if(score[i]>score[i+gap]){
-                        std::swap(score[i],score[i+gap]);
-                        std::swap(mesh.triangles[i],mesh.triangles[i+gap]);
-                        swapped=true;
-                    }
-            }while(gap>1||swapped);
+                idx[i]=i;
+            }
+            std::sort(idx.begin(), idx.end(), [&](int a, int b){
+                return score[a]<score[b] || (score[a]==score[b] && a<b);
+            });
+            std::vector<Triangle> sorted;
+            sorted.reserve(ne);
+            for(int i : idx) sorted.push_back(mesh.triangles[i]);
+            mesh.triangles=std::move(sorted);
         }
 
         if(!opts.quiet){

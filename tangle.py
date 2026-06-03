@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code Opus 4.6
 Translated from tangle.cpp
 
-Version 0.3
-2 May 2026
+Version 0.4
+2 Jun 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -67,6 +67,12 @@ CLOSE_ENOUGH = 1e-6
 # Reduced minimum angle (degrees) for tiny triangles in locally dense
 # regions where the full minimum angle is unachievable.
 TINY_TRI_ANGLE = 15.0
+
+# Hard cap on the requested minimum angle (degrees).  Delaunay refinement is
+# only guaranteed to terminate below ~33.8 deg (Ruppert/Shewchuk); matches the
+# ceiling FEMM enforces.  Under shortest-edge ordering refinement stays tame
+# right up to this bound.
+MINANGLE_MAX_VAL = 33.8
 
 
 # ============================================================
@@ -1846,7 +1852,7 @@ def assign_regions(mesh, opts):
 # Point insertion for quality refinement (Lawson flip-based)
 # ============================================================
 
-def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected):
+def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dist2=0.0):
     pidx = len(mesh.vertices)
     mesh.vertices.append(np)
 
@@ -1896,11 +1902,17 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected):
                 on_edge = j
                 break
 
-    # Check near-coincident with existing vertex
+    # Check near-coincident with existing vertex. The reject radius is normally
+    # EPS, but the quality-refinement caller passes min_dist2 = (0.5*shortest
+    # edge)^2 as a too-close guard: an off-center/circumcenter landing within half
+    # the bad triangle's shortest edge of an existing vertex is rejected (the
+    # triangle is then tolerated). Stops the insertion radius collapsing on
+    # near-degenerate geometry. No-op on well-conditioned meshes.
+    rej_r2 = max(EPS * EPS, min_dist2)
     for j in range(3):
         dx = mesh.vertices[t.v[j]].x - np.x
         dy = mesh.vertices[t.v[j]].y - np.y
-        if dx * dx + dy * dy < EPS * EPS:
+        if dx * dx + dy * dy < rej_r2:
             mesh.vertices.pop()
             return -1
 
@@ -2370,7 +2382,24 @@ def refine_quality(mesh, opts, n_input_verts):
     gymin -= 1
     gxmax += 1
     gymax += 1
-    g_nx, g_ny = 50, 50
+    # Size the grid so each cell holds ~O(1) segments at the final mesh density,
+    # not a fixed 50x50.  Estimate final segment count = (boundary length)/h,
+    # h = sqrt(domArea/estTotalTris); target ~sqrt(estSegs) cells/side.  Floor 50
+    # keeps low-segment meshes from over-building; cap 700 bounds memory.
+    g_target = 50
+    b_len = 0.0
+    for s in mesh.segments:
+        sa, sb = mesh.vertices[s.v0], mesh.vertices[s.v1]
+        b_len += math.sqrt((sb.x - sa.x) ** 2 + (sb.y - sa.y) ** 2)
+    dom_a = (gxmax - gxmin) * (gymax - gymin)
+    h = math.sqrt(dom_a / max(1.0, est_total_tris))
+    est_segs = b_len / h if h > 0 else 0.0
+    g = int(math.sqrt(max(1.0, est_segs)))
+    if g > g_target:
+        g_target = g
+    if g_target > 700:
+        g_target = 700
+    g_nx, g_ny = g_target, g_target
     gcell = max((gxmax - gxmin) / g_nx, (gymax - gymin) / g_ny)
     g_nx = int((gxmax - gxmin) / gcell) + 1
     g_ny = int((gymax - gymin) / gcell) + 1
@@ -2511,12 +2540,21 @@ def refine_quality(mesh, opts, n_input_verts):
                         return si
         return -1
 
-    # Priority queue: use negative metric for max-heap behavior
+    # Priority queue (min-heap): order by SHORTEST EDGE first.  The key is the
+    # bad triangle's smallest squared edge length, so the triangle with the
+    # shortest edge is processed first (Shewchuk-style; well-graded meshes at
+    # Triangle-class triangle counts).  Tuple = (minEdge2, idx, generation, retry).
+    REQUEUE_CAP = 2     # capped badIdx re-queue after an encroachment split
+    GUARD_FACTOR = 0.5  # too-close-insertion guard: reject radius factor
+
+    def prio_key(mr):
+        return min(mr[5], mr[6], mr[7])  # shortest squared edge
+
     pq = []
     for i in range(len(mesh.triangles)):
         mr = tri_metric(mesh, i, min_ang_val, global_max_a, use_region_area, cos_min_ang)
         if mr[0] > 0:
-            heappush(pq, (-mr[0], i, mesh.triangles[i].generation))
+            heappush(pq, (prio_key(mr), i, mesh.triangles[i].generation, 0))
 
     # Precompute off-center constant (loop-invariant)
     offconst = (0.475 * math.sqrt(
@@ -2526,7 +2564,7 @@ def refine_quality(mesh, opts, n_input_verts):
     dbg_encroach = dbg_insert = dbg_skip = dbg_fail = 0
 
     while pq and steiner_count[0] < max_steiner:
-        neg_metric, bad_idx, gen = heappop(pq)
+        _prio, bad_idx, gen, retry = heappop(pq)
 
         if bad_idx >= len(mesh.triangles):
             continue
@@ -2623,29 +2661,45 @@ def refine_quality(mesh, opts, n_input_verts):
             seg_aff = []
             if split_segment(enc_seg, seg_aff, bad_idx):
                 dbg_encroach += 1
-                # Don't explicitly re-queue badIdx: if the segment split
-                # modified it, it will be re-queued via seg_aff below.
-                # Re-queuing unchanged triangles creates infinite loops
-                # when their circumcenter always encroaches the same area.
+                # Triangles modified by the split are re-queued fresh (retry=0)
+                # via seg_aff below.  If badIdx was NOT among them, the split left
+                # it unchanged but may have removed the segment its circumcenter
+                # encroached, making it fixable — so re-queue it too with an
+                # incremented retry.  The cap stops the apex cascade.
+                if (bad_idx not in seg_aff and retry + 1 < REQUEUE_CAP and
+                        bad_idx < len(mesh.triangles) and
+                        mesh.triangles[bad_idx].v[0] >= 0):
+                    mrb = tri_metric(mesh, bad_idx, min_ang_val, global_max_a,
+                                     use_region_area, cos_min_ang)
+                    if mrb[0] > 0:
+                        heappush(pq, (prio_key(mrb), bad_idx,
+                                      mesh.triangles[bad_idx].generation, retry + 1))
                 for ti2 in seg_aff:
                     if 0 <= ti2 < len(mesh.triangles) and mesh.triangles[ti2].v[0] >= 0:
                         mr2 = tri_metric(mesh, ti2, min_ang_val, global_max_a,
                                          use_region_area, cos_min_ang)
                         if mr2[0] > 0:
-                            heappush(pq, (-mr2[0], ti2, mesh.triangles[ti2].generation))
+                            heappush(pq, (prio_key(mr2), ti2,
+                                          mesh.triangles[ti2].generation, 0))
                         for k in range(3):
                             nb = mesh.triangles[ti2].neighbors[k]
                             if nb >= 0:
                                 mr2 = tri_metric(mesh, nb, min_ang_val, global_max_a,
                                                  use_region_area, cos_min_ang)
                                 if mr2[0] > 0:
-                                    heappush(pq, (-mr2[0], nb, mesh.triangles[nb].generation))
+                                    heappush(pq, (prio_key(mr2), nb,
+                                                  mesh.triangles[nb].generation, 0))
             continue
 
-        # Insert
+        # Insert, with the too-close guard: reject an off-center/circumcenter
+        # that would land within (GUARD_FACTOR * shortest edge of the bad
+        # triangle) of an existing vertex.
+        min_edge2 = min(tmr_la2, tmr_lb2, tmr_lc2)
+        guard_dist2 = GUARD_FACTOR * GUARD_FACTOR * min_edge2
         np_pt = Point(tcx, tcy, len(mesh.vertices), 0)
         affected = []
-        new_pt = insert_point_lawson(mesh, np_pt, bad_idx, constrained_edges, affected)
+        new_pt = insert_point_lawson(mesh, np_pt, bad_idx, constrained_edges,
+                                     affected, guard_dist2)
         if new_pt < 0:
             dbg_fail += 1
             continue
@@ -2653,22 +2707,15 @@ def refine_quality(mesh, opts, n_input_verts):
         steiner_count[0] += 1
         dbg_insert += 1
 
-        # Use a flat sorted list instead of set to avoid hash overhead
-        to_check = list(affected)
-        for ti in affected:
-            if 0 <= ti < len(mesh.triangles) and mesh.triangles[ti].v[0] >= 0:
-                for j in range(3):
-                    nb = mesh.triangles[ti].neighbors[j]
-                    if nb >= 0:
-                        to_check.append(nb)
-        to_check.sort()
-        # Deduplicate
-        to_check = list(dict.fromkeys(to_check))
-        for ti in to_check:
+        # Re-check only the affected triangles.  insert_point_lawson records every
+        # modified triangle (split products + all flips) in `affected`, and a
+        # triangle's metric depends only on its own 3 vertices, so unmodified
+        # neighbors cannot have changed status — no neighbor sweep needed.
+        for ti in sorted(set(affected)):
             if 0 <= ti < len(mesh.triangles):
                 mr = tri_metric(mesh, ti, min_ang_val, global_max_a, use_region_area, cos_min_ang)
                 if mr[0] > 0:
-                    heappush(pq, (-mr[0], ti, mesh.triangles[ti].generation))
+                    heappush(pq, (prio_key(mr), ti, mesh.triangles[ti].generation, 0))
 
     if not opts.quiet:
         print(f"Quality refinement: {dbg_insert} Steiner points, "
@@ -2737,16 +2784,24 @@ def read_poly_file(filename):
     nv, dim, n_attribs, nmark = int(tokens[0]), int(tokens[1]), int(tokens[2]), int(tokens[3])
     pts = []
     first_vert_idx = float('inf')
-    for _ in range(nv):
-        tokens, idx = read_tokens(lines, idx)
-        pt_idx = int(tokens[0])
-        first_vert_idx = min(first_vert_idx, pt_idx)
-        x, y = float(tokens[1]), float(tokens[2])
-        attribs = [float(tokens[3 + a]) for a in range(n_attribs)]
-        marker = int(tokens[3 + n_attribs]) if nmark > 0 else 0
-        lfs_col = 3 + n_attribs + (1 if nmark > 0 else 0)
-        lfs = float(tokens[lfs_col]) if len(tokens) > lfs_col else -1.0
-        pts.append(Point(x, y, pt_idx, marker, attribs, lfs))
+    if nv == 0:
+        # Triangle convention: a .poly with 0 nodes references its companion
+        # .node file (this is what tangle now writes for output .poly).
+        node_file = (filename[:-5] if filename.endswith(".poly") else filename) + ".node"
+        pts, n_attribs, _nm = read_node_file(node_file)
+        for p in pts:
+            first_vert_idx = min(first_vert_idx, p.id)
+    else:
+        for _ in range(nv):
+            tokens, idx = read_tokens(lines, idx)
+            pt_idx = int(tokens[0])
+            first_vert_idx = min(first_vert_idx, pt_idx)
+            x, y = float(tokens[1]), float(tokens[2])
+            attribs = [float(tokens[3 + a]) for a in range(n_attribs)]
+            marker = int(tokens[3 + n_attribs]) if nmark > 0 else 0
+            lfs_col = 3 + n_attribs + (1 if nmark > 0 else 0)
+            lfs = float(tokens[lfs_col]) if len(tokens) > lfs_col else -1.0
+            pts.append(Point(x, y, pt_idx, marker, attribs, lfs))
     base = 0 if first_vert_idx == 0 else 1
 
     tokens, idx = read_tokens(lines, idx)
@@ -2929,18 +2984,13 @@ def write_neigh_file(fn, mesh, opts):
 
 
 def write_poly_file(fn, mesh, opts):
-    has_lfs = any(p.lfs > 0 for p in mesh.vertices)
     has_seg_lfs = any(s.lfs > 0 for s in mesh.segments)
     with open(fn, 'w') as f:
-        nv = len(mesh.vertices)
-        f.write(f"{nv} 2 0 1\n")
+        # Vertex count 0: the .poly references the companion .node file for its
+        # nodes (Shewchuk's Triangle convention) instead of duplicating them.
+        # Segment endpoints below index into the .node file.
+        f.write("0 2 0 1\n")
         off = 0 if opts.zero_indexed else 1
-        for i, v in enumerate(mesh.vertices):
-            out_idx = i + off
-            line = f"{out_idx} {v.x:.17g} {v.y:.17g} {v.marker}"
-            if has_lfs:
-                line += f" {v.lfs:.17g}"
-            f.write(line + "\n")
         f.write(f"{len(mesh.segments)} 1\n")
         for i, s in enumerate(mesh.segments):
             out_idx = i + off
@@ -2982,7 +3032,14 @@ def parse_options(switch_str):
                 num += switch_str[i]
                 i += 1
             if num:
-                opts.min_angle = float(num)
+                req = float(num)
+                if req > MINANGLE_MAX_VAL:
+                    sys.stderr.write(
+                        f"Warning: requested minimum angle {req} exceeds the "
+                        f"{MINANGLE_MAX_VAL} deg termination limit; clamping to "
+                        f"{MINANGLE_MAX_VAL}.\n")
+                    req = MINANGLE_MAX_VAL
+                opts.min_angle = req
         elif c == 'e':
             opts.edges = True
         elif c == 'A':
@@ -3399,10 +3456,25 @@ def main():
     if not opts.quiet:
         print(f"  Refinement: {elapsed():.1f} ms", file=sys.stderr)
 
-    # 7. Final cleanup: compact dead triangles, rebuild adjacency, extract edges
-    mesh.triangles = [t for t in mesh.triangles if t.v[0] >= 0]
-    mesh.rebuild_adjacency()
-    extract_edges(mesh)
+    # 7. Final cleanup: compact dead triangles, then extract edges.  Adjacency is
+    # maintained incrementally during refinement (insert_point_lawson keeps
+    # neighbors[] correct), so instead of rebuilding it from scratch we remap the
+    # surviving neighbor indices through the old->new compaction map (O(N)).
+    # Edges are consumed only by the .edge writer, so skip building them when no
+    # .edge output is requested.
+    remap = [-1] * len(mesh.triangles)
+    live = []
+    for i, t in enumerate(mesh.triangles):
+        if t.v[0] >= 0:
+            remap[i] = len(live)
+            live.append(t)
+    for t in live:
+        for j in range(3):
+            if t.neighbors[j] >= 0:
+                t.neighbors[j] = remap[t.neighbors[j]]
+    mesh.triangles = live
+    if opts.edges:
+        extract_edges(mesh)
     if not opts.quiet:
         print(f"  Cleanup+edges: {elapsed():.1f} ms", file=sys.stderr)
 
