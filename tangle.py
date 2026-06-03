@@ -4,7 +4,7 @@ tangle
 A 2D Delaunay triangulation tool compatible with Shewchuk's Triangle format.
 
 Author: David Meeker
-Generated with the assistance of Claude Code Opus 4.6
+Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
 Version 0.4

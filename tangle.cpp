@@ -3,7 +3,7 @@
 // A 2D Delaunay triangulation tool compatible with Shewchuk's Triangle format.
 //
 // Author: David Meeker
-// Generated with the assistance of Claude Code Opus 4.6
+// Generated with the assistance of Claude Code
 //
 // Version 0.4
 // 02 Jun 2026

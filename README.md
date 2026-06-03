@@ -15,7 +15,7 @@ functionality (`.poly`/`.node` input only).
 ## Authors
 
 - **David Meeker** — author
-- **Claude Code (Opus 4.6)** — development assistance
+- **Claude Code** — development assistance
 
 ## Why tangle?
 
