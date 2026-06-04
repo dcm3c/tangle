@@ -4640,8 +4640,13 @@ int main(int argc, char* argv[]){
     auto dot=base.rfind('.');
     if(dot!=std::string::npos){ext=base.substr(dot);base=base.substr(0,dot);}
     if(ext.empty()){
-        // Try FEMM extensions first if no extension given
-        for(auto tryExt:{".fem",".fee",".feh",".fec"}){
+        // A bare basename: prefer an existing .poly over a FEMM file. FEMM's
+        // two-step mesher invokes us with a bare name (and -p) and a deliberately
+        // crafted .poly that must be honored even when the model's .fem sits in
+        // the same directory. Only auto-detect a FEMM file when no .poly exists.
+        std::ifstream polyTest(inputFile+".poly");
+        if(polyTest.good()){ext=".poly";inputFile+=ext;}
+        else for(auto tryExt:{".fem",".fee",".feh",".fec"}){
             std::ifstream test(inputFile+tryExt);
             if(test.good()){ext=tryExt;inputFile+=ext;base=inputFile.substr(0,inputFile.size()-4);break;}
         }

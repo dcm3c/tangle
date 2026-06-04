@@ -154,13 +154,11 @@ def main():
 
     inp = args.input
 
-    # If input is a .poly file and no mesh exists, just show the PSLG
-    poly_only = False
-    if inp.endswith('.poly') and not os.path.exists(inp.replace('.poly', '.ele')):
-        base_name = inp[:-5]
-        _, node_file, ele_file = find_files(base_name)
-        if node_file is None:
-            poly_only = True
+    # An explicit .poly argument shows the PSLG itself, even when a mesh of the
+    # same base exists on disk — the explicit extension wins (mirrors tangle
+    # honoring an explicitly-named .poly over a derived file). To overlay a
+    # .poly on its mesh instead, view the mesh and pass -p.
+    poly_only = inp.endswith('.poly')
 
     if poly_only:
         verts, segs, holes = read_poly(inp)
