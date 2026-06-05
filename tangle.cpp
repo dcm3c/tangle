@@ -104,6 +104,7 @@ static const double MINANGLE_MAX_VAL = 33.8;
 struct Options {
     bool pslg          = false;
     bool no_poly_out   = false;
+    bool dump_poly     = false;  // -g: write input PSLG as a standalone .poly and exit (no meshing)
     bool jettison      = false;
     bool quality       = false;
     double min_angle   = 20.0;
@@ -301,6 +302,7 @@ struct Mesh {
     std::vector<Hole>     holes;
     std::vector<Region>   regions;
     std::vector<std::pair<int,int>> edges;
+    std::vector<char> edge_boundary;     // parallel to edges: 1 if boundary (1 incident triangle)
     std::vector<PBCNodePair> pbc_pairs; // filled after refinement
     std::map<int,int> pbc_twin;          // node↔twin mapping for PBC boundaries
     std::map<int,int> pbc_node_type;     // node→PBC type (0=periodic, 1=anti-periodic)
@@ -413,6 +415,12 @@ void buildDelaunay(Mesh& mesh){
     std::vector<int> visitEpoch;
     int epoch = 0;
 
+    // Reused across point insertions. badEpoch[t]==epoch marks "t is a bad
+    // (to-be-deleted) triangle" without an unordered_set; pidxFan is a small flat
+    // list (the fan around the new point is tiny) replacing an unordered_map.
+    std::vector<int> bad, stk, slots, badEpoch;
+    std::vector<std::pair<int,std::pair<int,int>>> pidxFan;
+
     for(int ii=0; ii<n; ii++){
         int pidx = order[ii];
         const Point& p = pts[pidx];
@@ -443,11 +451,13 @@ void buildDelaunay(Mesh& mesh){
         }
         if(startTri<0) continue;
 
-        // BFS cavity
+        // BFS cavity. badEpoch[t]==epoch marks t as a bad (to-be-deleted) triangle,
+        // giving O(1) cavity membership for the boundary scan with no hashing.
         epoch++;
         visitEpoch.resize(tris.size(), 0);
-        std::vector<int> bad;
-        std::vector<int> stk={startTri};
+        badEpoch.resize(tris.size(), 0);
+        bad.clear();
+        stk.clear(); stk.push_back(startTri);
         while(!stk.empty()){
             int cur=stk.back(); stk.pop_back();
             if(cur<0||cur>=(int)tris.size()||visitEpoch[cur]==epoch) continue;
@@ -455,7 +465,7 @@ void buildDelaunay(Mesh& mesh){
             const auto& t=tris[cur];
             if(t.v[0]<0) continue;
             if(inCircle(pts[t.v[0]],pts[t.v[1]],pts[t.v[2]],p)>0){
-                bad.push_back(cur);
+                bad.push_back(cur); badEpoch[cur]=epoch;
                 for(int j=0;j<3;j++){
                     if(t.neighbors[j]>=0 && visitEpoch[t.neighbors[j]]!=epoch)
                         stk.push_back(t.neighbors[j]);
@@ -464,17 +474,16 @@ void buildDelaunay(Mesh& mesh){
         }
 
         // Force-insert if cavity empty (near-coincident vertices)
-        if(bad.empty()) bad.push_back(startTri);
+        if(bad.empty()){ bad.push_back(startTri); badEpoch[startTri]=epoch; }
 
-        // Collect boundary polygon
-        std::unordered_set<int> badSet(bad.begin(), bad.end());
+        // Collect boundary polygon (edges to triangles outside the cavity)
         struct BndEdge { int v0, v1, outerTri, outerLocalEdge; };
         std::vector<BndEdge> poly;
         for(int bi : bad){
             const auto& t = tris[bi];
             for(int j=0;j<3;j++){
                 int nb=t.neighbors[j];
-                if(nb<0||!badSet.count(nb)){
+                if(nb<0 || badEpoch[nb]!=epoch){
                     int oe=-1;
                     if(nb>=0) for(int k=0;k<3;k++) if(tris[nb].neighbors[k]==bi){oe=k;break;}
                     poly.push_back({t.v[j], t.v[(j+1)%3], nb, oe});
@@ -484,7 +493,7 @@ void buildDelaunay(Mesh& mesh){
 
         int nNew=(int)poly.size();
         std::sort(bad.begin(), bad.end());
-        std::vector<int> slots;
+        slots.clear();
         for(int i=0; i<nNew && i<(int)bad.size(); i++) slots.push_back(bad[i]);
         while((int)slots.size()<nNew){
             slots.push_back((int)tris.size());
@@ -519,22 +528,26 @@ void buildDelaunay(Mesh& mesh){
             }
         }
 
-        // Wire internal adjacency
-        std::unordered_map<int, std::pair<int,int>> pidxEdges;
+        // Wire internal adjacency. The fan around pidx is tiny (~cavity edges),
+        // so a flat list with linear find beats an unordered_map (no hashing).
+        // Each spoke vertex appears in exactly two fan triangles: first inserts,
+        // second matches+removes -- same wiring as the map, just no hashing.
+        pidxFan.clear();
         for(int i=0; i<nNew; i++){
             int s=slots[i];
             for(int j=0;j<3;j++){
                 int a=tris[s].v[j], b=tris[s].v[(j+1)%3];
                 if(a!=pidx && b!=pidx) continue;
                 int other = (a==pidx)?b:a;
-                auto it=pidxEdges.find(other);
-                if(it!=pidxEdges.end()){
-                    auto [os,oe]=it->second;
+                int found=-1;
+                for(int q=0;q<(int)pidxFan.size();q++) if(pidxFan[q].first==other){found=q;break;}
+                if(found>=0){
+                    int os=pidxFan[found].second.first, oe=pidxFan[found].second.second;
                     tris[s].neighbors[j]=os;
                     tris[os].neighbors[oe]=s;
-                    pidxEdges.erase(it);
+                    pidxFan[found]=pidxFan.back(); pidxFan.pop_back();
                 } else {
-                    pidxEdges[other]={s,j};
+                    pidxFan.push_back({other,{s,j}});
                 }
             }
         }
@@ -750,6 +763,26 @@ int enforceConstraints(Mesh& mesh, bool quiet){
 
     auto v2t = buildV2T();
 
+    // Incremental v2t maintenance. Rebuilding the whole vertex->triangle map
+    // after every segment insertion is O(T) per segment, i.e. O(N*T) overall —
+    // which dominated runtime on segment-dense FEMM models (the full rebuild in
+    // the cavity path was ~40s of a 63s run on bigModel.fem). Instead, when a
+    // local retriangulation replaces a set of triangles, drop the old triangles
+    // from their vertices' lists and add the new ones, touching only O(cavity)
+    // entries. Stale duplicates are tolerated by every consumer (hasEdge and the
+    // fan scans re-validate via t.v[]), so removal need not be exhaustive.
+    auto v2tDrop = [&](int tri, const std::array<int,3>& oldV){
+        for(int w : oldV){
+            if(w<0 || w>=(int)v2t.size()) continue;
+            auto& L=v2t[w];
+            L.erase(std::remove(L.begin(),L.end(),tri), L.end());
+        }
+    };
+    auto v2tAddCurrent = [&](int tri){
+        const auto& tv=mesh.triangles[tri].v;
+        for(int j=0;j<3;j++){ int w=tv[j]; if(w>=0 && w<(int)v2t.size()) v2t[w].push_back(tri); }
+    };
+
     // Split segments at collinear intermediate vertices (Triangle's approach).
     // When vertices lie exactly on a segment between its endpoints, the walk-based
     // CDT can't find a starting triangle (orient2d returns 0 for all neighbors).
@@ -815,268 +848,6 @@ int enforceConstraints(Mesh& mesh, bool quiet){
         }
     }
 
-    int totalMissing = 0;
-    for(int pass=0; pass<5; pass++){
-        int enforced = 0;
-        for(auto& seg : mesh.segments){
-            int u=seg.v0, v=seg.v1;
-            if(mesh.hasEdge(u,v,v2t)) continue;
-
-            // Try walking from both endpoints, with optional SoS perturbation
-            bool success = false;
-            for(int attempt=0; attempt<4 && !success; attempt++){
-                int su = (attempt%2==0)?u:v;
-                int sv = (attempt%2==0)?v:u;
-
-                // For attempts 2-3, use SoS perturbation to break collinearity
-                // Create a virtual target point slightly offset from sv
-                Point sv_pert = mesh.vertices[sv];
-                if(attempt >= 2){
-                    // Perpendicular perturbation to the segment direction
-                    double dx=mesh.vertices[sv].x-mesh.vertices[su].x;
-                    double dy=mesh.vertices[sv].y-mesh.vertices[su].y;
-                    double len=std::sqrt(dx*dx+dy*dy);
-                    if(len>EPS){
-                        // Perturb perpendicular: rotate direction 90° and scale tiny
-                        double eps=len*1e-8;
-                        sv_pert.y += eps; // simple y perturbation
-                    }
-                }
-
-                // orient2d test using potentially perturbed sv
-                auto orient_seg = [&](const Point& p) -> double {
-                    return orient2d(mesh.vertices[su], sv_pert, p);
-                };
-
-                // Find starting triangle using finddirection
-                int startTri = -1;
-                {
-                    int curTri = -1;
-                    for(int ti : v2t[su])
-                        if(mesh.triangles[ti].v[0]>=0){ curTri=ti; break; }
-                    if(curTri<0) continue;
-
-                    // Check if sv is already adjacent
-                    for(int ti : v2t[su]){
-                        auto& t=mesh.triangles[ti];
-                        if(t.v[0]<0) continue;
-                        for(int j=0;j<3;j++) if(t.v[j]==sv){success=true;break;}
-                        if(success) break;
-                    }
-                    if(success) continue;
-
-                    auto getLocalU = [&](int ti) -> int {
-                        for(int j=0;j<3;j++) if(mesh.triangles[ti].v[j]==su) return j;
-                        return -1;
-                    };
-
-                    // Scan all fan triangles to find the one the segment ray exits through.
-                    // For each triangle, check: right is on/above and left is on/below the
-                    // line su→sv, AND the opposite edge midpoint is in the forward direction.
-                    int bestTri = -1;
-                    double bestDot = -1e30;
-                    double sdx=mesh.vertices[sv].x-mesh.vertices[su].x;
-                    double sdy=mesh.vertices[sv].y-mesh.vertices[su].y;
-                    for(int ti : v2t[su]){
-                        auto& t=mesh.triangles[ti];
-                        if(t.v[0]<0) continue;
-                        int lu = getLocalU(ti);
-                        if(lu<0) continue;
-                        int right = t.v[(lu+1)%3], left = t.v[(lu+2)%3];
-                        double oRight = orient_seg(mesh.vertices[right]);
-                        double oLeft  = orient_seg(mesh.vertices[left]);
-                        if(oRight >= 0 && oLeft <= 0){
-                            // Straddling triangle — check forward direction
-                            double mx=(mesh.vertices[right].x+mesh.vertices[left].x)/2;
-                            double my=(mesh.vertices[right].y+mesh.vertices[left].y)/2;
-                            double dmx=mx-mesh.vertices[su].x, dmy=my-mesh.vertices[su].y;
-                            double dot=sdx*dmx+sdy*dmy;
-                            if(dot > bestDot){
-                                bestDot = dot;
-                                bestTri = ti;
-                            }
-                        }
-                    }
-                    startTri = bestTri;
-                }
-                if(success) continue;
-                if(startTri<0) continue;
-
-                // Walk from su to sv collecting crossed triangles and chains
-                auto& st = mesh.triangles[startTri];
-                int localU = -1;
-                for(int j=0;j<3;j++) if(st.v[j]==su) localU=j;
-                int a=st.v[(localU+1)%3], b=st.v[(localU+2)%3];
-                double oa=orient_seg(mesh.vertices[a]);
-
-                int firstAbove, firstBelow;
-                if(oa>=0){ firstAbove=a; firstBelow=b; }
-                else     { firstAbove=b; firstBelow=a; }
-
-                std::vector<int> crossedTris = {startTri};
-                std::vector<int> aboveChain = {firstAbove};
-                std::vector<int> belowChain = {firstBelow};
-
-                // Collect boundary edges (edges of crossed tris not crossed by segment)
-                struct BndEdge { int v0,v1,outerTri,outerEdge; };
-                std::vector<BndEdge> bndEdges;
-
-                // Boundary edges of first triangle (the two edges incident to su)
-                for(int j=0;j<3;j++){
-                    int ev0=st.v[j], ev1=st.v[(j+1)%3];
-                    if((ev0==firstAbove&&ev1==firstBelow)||(ev0==firstBelow&&ev1==firstAbove)) continue;
-                    int nb=st.neighbors[j]; int oe=-1;
-                    if(nb>=0) for(int k=0;k<3;k++) if(mesh.triangles[nb].neighbors[k]==startTri){oe=k;break;}
-                    bndEdges.push_back({ev0,ev1,nb,oe});
-                }
-
-                // Check if first triangle already contains sv
-                bool reachedSv = false;
-                for(int j=0;j<3;j++) if(st.v[j]==sv){ reachedSv=true; break; }
-
-                int prevAbove=firstAbove, prevBelow=firstBelow;
-                std::set<int> visitedTris;
-                visitedTris.insert(startTri);
-
-                while(!reachedSv){
-                    int lastTri2 = crossedTris.back();
-                    auto& lt = mesh.triangles[lastTri2];
-                    // Find the neighbor across the frontier edge (prevAbove, prevBelow)
-                    int nextTri = -1;
-                    for(int j=0;j<3;j++){
-                        int ev0=lt.v[j], ev1=lt.v[(j+1)%3];
-                        if((ev0==prevAbove&&ev1==prevBelow)||(ev0==prevBelow&&ev1==prevAbove)){
-                            nextTri=lt.neighbors[j]; break;
-                        }
-                    }
-                    if(nextTri<0 || visitedTris.count(nextTri)) break;
-                    visitedTris.insert(nextTri);
-                    crossedTris.push_back(nextTri);
-
-                    auto& nt = mesh.triangles[nextTri];
-                    int newVert = -1;
-                    for(int j=0;j<3;j++)
-                        if(nt.v[j]!=prevAbove && nt.v[j]!=prevBelow) newVert=nt.v[j];
-                    if(newVert<0) break;
-
-                    if(newVert==sv){
-                        reachedSv=true;
-                        // Add boundary edges of last triangle (not the frontier edge)
-                        for(int j=0;j<3;j++){
-                            int ev0=nt.v[j], ev1=nt.v[(j+1)%3];
-                            if((ev0==prevAbove&&ev1==prevBelow)||(ev0==prevBelow&&ev1==prevAbove)) continue;
-                            int nb=nt.neighbors[j]; int oe=-1;
-                            if(nb>=0) for(int k=0;k<3;k++) if(mesh.triangles[nb].neighbors[k]==nextTri){oe=k;break;}
-                            bndEdges.push_back({ev0,ev1,nb,oe});
-                        }
-                    } else {
-                        double side=orient_seg(mesh.vertices[newVert]);
-                        if(side>0){
-                            aboveChain.push_back(newVert);
-                            // Boundary edge: the edge from newVert to prevAbove
-                            for(int j=0;j<3;j++){
-                                int ev0=nt.v[j], ev1=nt.v[(j+1)%3];
-                                if((ev0==prevAbove&&ev1==prevBelow)||(ev0==prevBelow&&ev1==prevAbove)) continue;
-                                if((ev0==newVert&&ev1==prevBelow)||(ev0==prevBelow&&ev1==newVert)) continue;
-                                int nb=nt.neighbors[j]; int oe=-1;
-                                if(nb>=0) for(int k=0;k<3;k++) if(mesh.triangles[nb].neighbors[k]==nextTri){oe=k;break;}
-                                bndEdges.push_back({ev0,ev1,nb,oe});
-                            }
-                            prevAbove=newVert;
-                        } else {
-                            belowChain.push_back(newVert);
-                            for(int j=0;j<3;j++){
-                                int ev0=nt.v[j], ev1=nt.v[(j+1)%3];
-                                if((ev0==prevAbove&&ev1==prevBelow)||(ev0==prevBelow&&ev1==prevAbove)) continue;
-                                if((ev0==prevAbove&&ev1==newVert)||(ev0==newVert&&ev1==prevAbove)) continue;
-                                int nb=nt.neighbors[j]; int oe=-1;
-                                if(nb>=0) for(int k=0;k<3;k++) if(mesh.triangles[nb].neighbors[k]==nextTri){oe=k;break;}
-                                bndEdges.push_back({ev0,ev1,nb,oe});
-                            }
-                            prevBelow=newVert;
-                        }
-                    }
-                }
-
-                if(!reachedSv) continue;
-
-                // Build above and below polygons
-                std::vector<int> abovePoly = {su};
-                abovePoly.insert(abovePoly.end(), aboveChain.begin(), aboveChain.end());
-                abovePoly.push_back(sv);
-
-                std::vector<int> belowPoly = {sv};
-                for(int i=(int)belowChain.size()-1;i>=0;i--) belowPoly.push_back(belowChain[i]);
-                belowPoly.push_back(su);
-
-                auto aboveTris = earClip(abovePoly);
-                auto belowTris = earClip(belowPoly);
-
-                int totalNew = (int)aboveTris.size()+(int)belowTris.size();
-                int totalOld = (int)crossedTris.size();
-                if(totalNew==0) continue;
-
-                // Assign slots
-                std::sort(crossedTris.begin(), crossedTris.end());
-                std::vector<int> slots;
-                for(int i=0;i<totalOld&&i<totalNew;i++) slots.push_back(crossedTris[i]);
-                while((int)slots.size()<totalNew){
-                    slots.push_back((int)mesh.triangles.size());
-                    mesh.triangles.push_back(Triangle{{-1,-1,-1},{-1,-1,-1},0,-1,0});
-                }
-                for(int i=totalNew;i<totalOld;i++){
-                    mesh.triangles[crossedTris[i]].v={-1,-1,-1};
-                    mesh.triangles[crossedTris[i]].neighbors={-1,-1,-1};
-                }
-
-                // Place new triangles
-                std::vector<std::array<int,3>> allNew;
-                allNew.insert(allNew.end(), aboveTris.begin(), aboveTris.end());
-                allNew.insert(allNew.end(), belowTris.begin(), belowTris.end());
-                for(int i=0;i<totalNew;i++){
-                    int s=slots[i];
-                    mesh.triangles[s].v=allNew[i];
-                    mesh.triangles[s].neighbors={-1,-1,-1};
-                    mesh.triangles[s].region_attrib=0;
-                    mesh.triangles[s].region_max_area=-1;
-                    mesh.triangles[s].marker=0;
-                }
-
-                // Wire internal adjacency among new triangles
-                std::map<std::pair<int,int>,std::pair<int,int>> edgeMap;
-                for(int i=0;i<totalNew;i++){
-                    int s=slots[i];
-                    auto& t=mesh.triangles[s];
-                    for(int j=0;j<3;j++){
-                        auto key=edgeKey(t.v[j],t.v[(j+1)%3]);
-                        auto it=edgeMap.find(key);
-                        if(it!=edgeMap.end()){
-                            auto [os,oe]=it->second;
-                            t.neighbors[j]=os; mesh.triangles[os].neighbors[oe]=s;
-                            edgeMap.erase(it);
-                        } else edgeMap[key]={s,j};
-                    }
-                }
-
-                // Wire boundary edges
-                for(auto& be : bndEdges){
-                    auto key=edgeKey(be.v0,be.v1);
-                    auto it=edgeMap.find(key);
-                    if(it!=edgeMap.end()){
-                        auto [s,j]=it->second;
-                        mesh.triangles[s].neighbors[j]=be.outerTri;
-                        if(be.outerTri>=0 && be.outerEdge>=0)
-                            mesh.triangles[be.outerTri].neighbors[be.outerEdge]=s;
-                    }
-                }
-
-                v2t = buildV2T();
-                success = true;
-                enforced++;
-            }
-        }
-        if(enforced==0 && pass>0) break;
-    }
 
     // Direct adjacency check: for short segments where su and sv are in adjacent
     // triangles (separated by a single edge), insert the edge by flipping.
@@ -1124,11 +895,14 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                             if((e0==a&&e1==q)||(e0==q&&e1==a)) N_aq=tn.neighbors[k];
                             if((e0==q&&e1==b)||(e0==b&&e1==q)) N_qb=tn.neighbors[k];
                         }
+                        std::array<int,3> oVti=t.v, oVnb=tn.v;
                         t.v={p,a,q}; t.neighbors={N_pa, N_aq, nb};
                         tn.v={p,q,b}; tn.neighbors={ti, N_qb, N_bp};
                         if(N_aq>=0) for(int k=0;k<3;k++) if(mesh.triangles[N_aq].neighbors[k]==nb){mesh.triangles[N_aq].neighbors[k]=ti;break;}
                         if(N_bp>=0) for(int k=0;k<3;k++) if(mesh.triangles[N_bp].neighbors[k]==ti){mesh.triangles[N_bp].neighbors[k]=nb;break;}
-                        v2t=buildV2T();
+                        // Incremental v2t for the two flipped triangles.
+                        v2tDrop(ti, oVti); v2tDrop(nb, oVnb);
+                        v2tAddCurrent(ti); v2tAddCurrent(nb);
                         anyFixed=true;
                         goto nextSeg;
                     }
@@ -1139,11 +913,6 @@ int enforceConstraints(Mesh& mesh, bool quiet){
     }
 
     {
-        // Build set of constraint edges to protect during flipping
-        EdgeSet segEdges;
-        for(auto& s2:mesh.segments)
-            if(mesh.hasEdge(s2.v0,s2.v1,v2t)) segEdges.insert(edgeKey(s2.v0,s2.v1));
-
         // Check if segment (v1,v2) properly intersects edge (v3,v4)
         auto segsCross = [&](int v1, int v2, int v3, int v4) -> bool {
             double d1=orient2d(mesh.vertices[v1],mesh.vertices[v2],mesh.vertices[v3]);
@@ -1159,162 +928,30 @@ int enforceConstraints(Mesh& mesh, bool quiet){
             int su=seg.v0, sv=seg.v1;
             if(mesh.hasEdge(su,sv,v2t)) continue;
 
-            // Walk from su toward sv collecting crossing edges, then flip them
-            {
-                // Try walking from both endpoints
-                for(int attempt=0; attempt<2 && !mesh.hasEdge(su,sv,v2t); attempt++){
-                    int wu = (attempt==0)?su:sv;
-                    int wv = (attempt==0)?sv:su;
-
-                    // Find starting triangle in wu's fan that straddles the segment
-                    double sdx = mesh.vertices[wv].x - mesh.vertices[wu].x;
-                    double sdy = mesh.vertices[wv].y - mesh.vertices[wu].y;
-                    int startTri = -1;
-                    for(int ti : v2t[wu]){
-                        auto& t = mesh.triangles[ti];
-                        if(t.v[0]<0) continue;
-                        int lu = -1;
-                        for(int j=0;j<3;j++) if(t.v[j]==wu){ lu=j; break; }
-                        if(lu<0) continue;
-                        int right = t.v[(lu+1)%3], left = t.v[(lu+2)%3];
-                        double oR = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[right]);
-                        double oL = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[left]);
-                        if(oR >= 0 && oL <= 0){
-                            double mx=(mesh.vertices[right].x+mesh.vertices[left].x)*0.5;
-                            double my=(mesh.vertices[right].y+mesh.vertices[left].y)*0.5;
-                            if(sdx*(mx-mesh.vertices[wu].x)+sdy*(my-mesh.vertices[wu].y) > 0){
-                                startTri=ti; break;
-                            }
-                        }
-                    }
-                    if(startTri<0) continue;
-
-                    // Walk to collect crossing edges
-                    auto& st = mesh.triangles[startTri];
-                    int lu = -1;
-                    for(int j=0;j<3;j++) if(st.v[j]==wu){ lu=j; break; }
-                    int ra=st.v[(lu+1)%3], rb=st.v[(lu+2)%3];
-                    double oa = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[ra]);
-                    int prevAbove = (oa>=0)?ra:rb, prevBelow = (oa>=0)?rb:ra;
-
-                    std::deque<std::pair<int,int>> flipQueue;
-                    flipQueue.push_back(edgeKey(prevAbove, prevBelow));
-
-                    std::unordered_set<int> visited;
-                    visited.insert(startTri);
-                    int curTri = startTri;
-                    bool reached = false;
-                    for(int step=0; step<(int)mesh.triangles.size()*2 && !reached; step++){
-                        int nextTri = -1;
-                        auto& ct = mesh.triangles[curTri];
-                        for(int j=0;j<3;j++){
-                            int ev0=ct.v[j], ev1=ct.v[(j+1)%3];
-                            if((ev0==prevAbove&&ev1==prevBelow)||(ev0==prevBelow&&ev1==prevAbove)){
-                                nextTri=ct.neighbors[j]; break;
-                            }
-                        }
-                        if(nextTri<0 || visited.count(nextTri)) break;
-                        visited.insert(nextTri);
-                        curTri = nextTri;
-
-                        auto& nt = mesh.triangles[nextTri];
-                        int newVert = -1;
-                        for(int j=0;j<3;j++) if(nt.v[j]!=prevAbove && nt.v[j]!=prevBelow) newVert=nt.v[j];
-                        if(newVert<0) break;
-                        if(newVert==wv){ reached=true; break; }
-
-                        double side = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[newVert]);
-                        if(side > 0){
-                            flipQueue.push_back(edgeKey(newVert, prevBelow));
-                            prevAbove = newVert;
-                        } else {
-                            flipQueue.push_back(edgeKey(prevAbove, newVert));
-                            prevBelow = newVert;
-                        }
-                    }
-                    if(!reached) continue;
-
-                    // Flip crossing edges (standard CDT flip algorithm)
-                    int maxIter = (int)flipQueue.size() * (int)flipQueue.size() + 10;
-                    while(!flipQueue.empty() && maxIter-- > 0){
-                        auto [ea, eb] = flipQueue.front(); flipQueue.pop_front();
-                        if(!segsCross(su, sv, ea, eb)) continue;
-                        if(segEdges.count(edgeKey(ea, eb))) continue;
-
-                        // Find two triangles sharing edge (ea,eb) via v2t
-                        int ti=-1, nbTri=-1, tiEdge=-1, nbEdge2=-1;
-                        for(int t : v2t[ea]){
-                            auto& tr = mesh.triangles[t];
-                            if(tr.v[0]<0) continue;
-                            for(int j=0;j<3;j++){
-                                if((tr.v[j]==ea && tr.v[(j+1)%3]==eb)||(tr.v[j]==eb && tr.v[(j+1)%3]==ea)){
-                                    if(ti<0){ ti=t; tiEdge=j; }
-                                    else { nbTri=t; nbEdge2=j; }
-                                }
-                            }
-                        }
-                        if(ti<0 || nbTri<0) continue;
-
-                        int p = mesh.triangles[ti].v[(tiEdge+2)%3];
-                        int q = mesh.triangles[nbTri].v[(nbEdge2+2)%3];
-
-                        // Check convexity
-                        double co1=orient2d(mesh.vertices[p],mesh.vertices[ea],mesh.vertices[q]);
-                        double co2=orient2d(mesh.vertices[p],mesh.vertices[q],mesh.vertices[eb]);
-                        if(co1<0||co2<0){
-                            flipQueue.push_back({ea, eb}); // defer
-                            continue;
-                        }
-
-                        // Flip (ea,eb) → (p,q)
-                        auto& T1=mesh.triangles[ti];
-                        auto& T2=mesh.triangles[nbTri];
-                        int N_pa=-1, N_bp=-1;
-                        for(int k=0;k<3;k++){
-                            int e0=T1.v[k], e1=T1.v[(k+1)%3];
-                            if((e0==p&&e1==ea)||(e0==ea&&e1==p)) N_pa=T1.neighbors[k];
-                            if((e0==eb&&e1==p)||(e0==p&&e1==eb)) N_bp=T1.neighbors[k];
-                        }
-                        int N_aq=-1, N_qb=-1;
-                        for(int k=0;k<3;k++){
-                            int e0=T2.v[k], e1=T2.v[(k+1)%3];
-                            if((e0==ea&&e1==q)||(e0==q&&e1==ea)) N_aq=T2.neighbors[k];
-                            if((e0==q&&e1==eb)||(e0==eb&&e1==q)) N_qb=T2.neighbors[k];
-                        }
-                        T1.v={p,ea,q}; T1.neighbors={N_pa, N_aq, nbTri};
-                        T2.v={p,q,eb}; T2.neighbors={ti, N_qb, N_bp};
-                        if(N_aq>=0) for(int k=0;k<3;k++) if(mesh.triangles[N_aq].neighbors[k]==nbTri){mesh.triangles[N_aq].neighbors[k]=ti;break;}
-                        if(N_bp>=0) for(int k=0;k<3;k++) if(mesh.triangles[N_bp].neighbors[k]==ti){mesh.triangles[N_bp].neighbors[k]=nbTri;break;}
-
-                        // Incremental v2t: T1 lost eb gained q, T2 lost ea gained p
-                        v2t[eb].erase(std::remove(v2t[eb].begin(), v2t[eb].end(), ti), v2t[eb].end());
-                        v2t[ea].erase(std::remove(v2t[ea].begin(), v2t[ea].end(), nbTri), v2t[ea].end());
-                        v2t[q].push_back(ti);
-                        v2t[p].push_back(nbTri);
-
-                        // If new edge still crosses, re-enqueue
-                        if(segsCross(su, sv, p, q))
-                            flipQueue.push_back(edgeKey(p, q));
-                    }
-                }
-            }
-            if(mesh.hasEdge(su,sv,v2t)){
-                segEdges.insert(edgeKey(su,sv));
-                continue; // skip cavity approach
-            }
-
-            // Second fallback: cavity-based approach
+            // Cavity enforcement: retriangulate the corridor the segment crosses.
             {
                 std::set<int> crossedSet;
-                // Include triangles that have at least one edge strictly crossing the segment
-                for(int ti=0;ti<(int)mesh.triangles.size();ti++){
-                    auto& t=mesh.triangles[ti]; if(t.v[0]<0) continue;
-                    for(int j=0;j<3;j++){
-                        int a=t.v[j], b=t.v[(j+1)%3];
-                        if(segsCross(su,sv,a,b)){
-                            crossedSet.insert(ti);
-                            break;
-                        }
+                // Collect triangles with an edge strictly crossing the segment.
+                // These form a connected corridor between su and sv (a straight
+                // segment crosses a connected strip of triangles), so flood-fill
+                // from the su/sv fans finds them all in O(corridor) — vs the old
+                // O(T) scan over every triangle (which was ~5.4s of bigModel's
+                // enforce: 3360 hard segments x ~140k triangles each).
+                {
+                    std::vector<int> stk;
+                    auto consider=[&](int ti){
+                        if(ti<0) return;
+                        auto& t=mesh.triangles[ti]; if(t.v[0]<0) return;
+                        if(crossedSet.count(ti)) return;
+                        for(int j=0;j<3;j++)
+                            if(segsCross(su,sv,t.v[j],t.v[(j+1)%3])){ crossedSet.insert(ti); stk.push_back(ti); return; }
+                    };
+                    for(int vi : {su, sv})
+                        for(int ti : v2t[vi]) consider(ti);
+                    while(!stk.empty()){
+                        int ti=stk.back(); stk.pop_back();
+                        auto& t=mesh.triangles[ti];
+                        for(int j=0;j<3;j++) consider(t.neighbors[j]);
                     }
                 }
                 // Also include su/sv fan triangles that are "between" the crossed region
@@ -1462,6 +1099,9 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                         // Assign slots
                         std::vector<int> crossedVec(crossedSet.begin(),crossedSet.end());
                         std::sort(crossedVec.begin(),crossedVec.end());
+                        // Snapshot old triangle vertices before overwrite for incremental v2t.
+                        std::vector<std::array<int,3>> oldCrossedV2; oldCrossedV2.reserve(crossedVec.size());
+                        for(int ct : crossedVec) oldCrossedV2.push_back(mesh.triangles[ct].v);
                         int totalNew=(int)newTris.size();
                         int totalOld=(int)crossedVec.size();
 
@@ -1520,12 +1160,11 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                             }
                         }
 
-                        v2t=buildV2T();
+                        // Incremental v2t: drop the old crossed triangles, add the new ones.
+                        for(size_t i=0;i<crossedVec.size();i++) v2tDrop(crossedVec[i], oldCrossedV2[i]);
+                        for(int i=0;i<totalNew;i++) v2tAddCurrent(slots[i]);
                     }
                 }
-            }
-            if(mesh.hasEdge(su,sv,v2t)){
-                segEdges.insert(edgeKey(su,sv));
             }
         }
     }
@@ -2291,6 +1930,24 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
 
     for(int si=0;si<(int)mesh.segments.size();si++) gridAddSeg(si);
 
+    // Precomputed diametral-circle (center, squared radius) per segment, so the
+    // encroachment query reads one contiguous 24-byte record instead of loading
+    // the segment + two scattered vertices and recomputing midpoint/radius for
+    // every candidate point. Kept bit-identical to the inline formula it
+    // replaces; no_split segments get the sentinel r2=-1 (dd2>=0 never < -1), so
+    // they're skipped exactly as the old `if(s.no_split) continue;` did.
+    struct SegBounds { double cx, cy, r2; };
+    std::vector<SegBounds> segBounds(mesh.segments.size());
+    auto updateSegBounds=[&](int si){
+        if((int)segBounds.size()<=si) segBounds.resize(si+1);
+        auto& s=mesh.segments[si];
+        if(s.no_split){ segBounds[si].r2=-1.0; return; }
+        auto& sa=mesh.vertices[s.v0]; auto& sb=mesh.vertices[s.v1];
+        segBounds[si].cx=(sa.x+sb.x)*0.5; segBounds[si].cy=(sa.y+sb.y)*0.5;
+        segBounds[si].r2=((sb.x-sa.x)*(sb.x-sa.x)+(sb.y-sa.y)*(sb.y-sa.y))*0.25;
+    };
+    for(int si=0;si<(int)mesh.segments.size();si++) updateSegBounds(si);
+
     // Map from edge key to segment index, for finding PBC partner segments.
     // Only needed (and only populated) when periodic boundaries are present.
     std::unordered_map<std::pair<int,int>,int,PairHash> edgeToSeg;
@@ -2341,6 +1998,8 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         }
         gridAddSeg(si);
         gridAddSeg(newSi);
+        updateSegBounds(si);
+        updateSegBounds(newSi);
         return midIdx;
     };
 
@@ -2393,13 +2052,9 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             int cx=gcx+dx, cy=gcy+dy;
             if(cx<0||cx>=gNX||cy<0||cy>=gNY) continue;
             for(int si:segGrid[cx*gNY+cy]){
-                auto& s=mesh.segments[si];
-                if(s.no_split) continue; // AGE chords must stay uniformly spaced
-                auto& sa=mesh.vertices[s.v0]; auto& sb=mesh.vertices[s.v1];
-                double mx2=(sa.x+sb.x)*0.5, my2=(sa.y+sb.y)*0.5;
-                double sr2=((sb.x-sa.x)*(sb.x-sa.x)+(sb.y-sa.y)*(sb.y-sa.y))*0.25;
-                double dd2=(px-mx2)*(px-mx2)+(py-my2)*(py-my2);
-                if(dd2<sr2) return si;
+                auto& b=segBounds[si]; // no_split folded in as r2=-1 sentinel
+                double dd2=(px-b.cx)*(px-b.cx)+(py-b.cy)*(py-b.cy);
+                if(dd2<b.r2) return si;
             }
         }
         return -1;
@@ -2511,7 +2166,6 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         auto tmr = triMetric(mesh, badIdx, minAng, globalMaxA, useRegionArea, cosMinAng);
         if(tmr.metric <= 0) continue;
         bool angViol=tmr.angViol, areaViol=tmr.areaViol;
-        double area=tmr.area, effectiveMaxArea=tmr.effectiveMaxArea;
 
         auto& a=mesh.vertices[bt.v[0]];
         auto& b=mesh.vertices[bt.v[1]];
@@ -2918,9 +2572,11 @@ void buildPbcTwinFromCDT(Mesh& mesh){
 
 void extractEdges(Mesh& mesh){
     mesh.edges.clear();
+    mesh.edge_boundary.clear();
     // A 2D triangulation has ~1.5 edges per triangle; reserve up front.
     size_t nt=mesh.triangles.size();
     mesh.edges.reserve(nt*3/2+8);
+    mesh.edge_boundary.reserve(nt*3/2+8);
     // Dedup via the maintained adjacency instead of hashing every edge.
     // neighbors[j] is the triangle across edge (v[j], v[(j+1)%3]); emit each
     // edge once, at its lower-indexed incident triangle (or at a boundary
@@ -2933,8 +2589,10 @@ void extractEdges(Mesh& mesh){
         if(t.v[0]<0) continue;
         for(int j=0;j<3;j++){
             int nb=t.neighbors[j];
-            if(nb<0 || i<nb)
+            if(nb<0 || i<nb){
                 mesh.edges.push_back({t.v[j],t.v[(j+1)%3]});
+                mesh.edge_boundary.push_back(nb<0 ? 1 : 0);
+            }
         }
     }
 }
@@ -3893,23 +3551,29 @@ void writeEleFile(const std::string& fn, const Mesh& mesh, bool hasAttrib, const
 
 void writeEdgeFile(const std::string& fn, const Mesh& mesh, const Options& opts){
     std::ofstream f(fn);
-    std::unordered_map<std::pair<int,int>,int,PairHash> edgeCount;
-    edgeCount.reserve(mesh.triangles.size()*2);
-    for(auto& t:mesh.triangles){
-        if(t.v[0]<0) continue;
-        for(int j=0;j<3;j++) edgeCount[edgeKey(t.v[j],t.v[(j+1)%3])]++;
-    }
     // Build map from edge to segment marker
     std::unordered_map<std::pair<int,int>,int,PairHash> segMarker;
     segMarker.reserve(mesh.segments.size()*2+8);
     for(auto& s:mesh.segments) segMarker[edgeKey(s.v0,s.v1)]=s.marker;
+    // Boundary-ness already came from extractEdges (via the maintained neighbors[]
+    // adjacency: an edge is boundary iff it has one incident triangle). Use that
+    // flag instead of rehashing every triangle's 3 edges here — that incidence
+    // hash was ~600ms / 20% of bigModel's runtime. Only rebuild it if the flag
+    // array is somehow stale (sizes disagree).
+    std::unordered_map<std::pair<int,int>,int,PairHash> edgeCount;
+    const bool haveFlags = (mesh.edge_boundary.size()==mesh.edges.size());
+    if(!haveFlags){
+        edgeCount.reserve(mesh.triangles.size()*2);
+        for(auto& t:mesh.triangles){ if(t.v[0]<0) continue;
+            for(int j=0;j<3;j++) edgeCount[edgeKey(t.v[j],t.v[(j+1)%3])]++; }
+    }
     std::string out; out.reserve(1u<<20);
     appendInt(out,(long long)mesh.edges.size()); out+=" 1\n";
     for(int i=0;i<(int)mesh.edges.size();i++){
         int a=mesh.edges[i].first, b=mesh.edges[i].second;
         auto key=edgeKey(a,b);
         int marker=0;
-        bool isBoundary = (edgeCount[key]==1);
+        bool isBoundary = haveFlags ? (mesh.edge_boundary[i]!=0) : (edgeCount[key]==1);
         auto it=segMarker.find(key);
         if(it!=segMarker.end()){
             marker=it->second;
@@ -4084,6 +3748,7 @@ Options parseOptions(const std::string& switchStr){
         switch(c){
             case 'p': opts.pslg=true; break;
             case 'P': opts.no_poly_out=true; break;
+            case 'g': opts.dump_poly=true; break;
             case 'j': opts.jettison=true; break;
             case 'q':
                 opts.quality=true;
@@ -4205,8 +3870,59 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
         segs = std::move(good);
     }
 
+    // Spatial grid shared by sections 4 and 5, replacing their O(S*N) / O(S^2)
+    // brute-force scans. A segment's candidate points/segments are gathered from
+    // the grid cells its supporting line passes through (sampled at <=1-cell
+    // steps, each expanded to a 3x3 halo so anything within tol of the line is
+    // covered). Candidates are processed in ascending index order and the same
+    // per-candidate tests/first-match rule as the brute-force code are applied,
+    // so the output is identical -- just without the quadratic scan. On already-
+    // clean input (the common FEMM case) nothing splits and each section is a
+    // single O(S) pass. Grid side is capped at 1024, so cells >> tol always.
+    int gnx=1, gny=1; double gx0=0, gy0=0, gcell=1;
+    std::vector<int> cellEpoch; int cellEpochCtr=0;
+    auto rebuildGridDims=[&](){
+        double xmn=pts[0].x,xmx=pts[0].x,ymn=pts[0].y,ymx=pts[0].y;
+        for(auto& p:pts){ xmn=std::min(xmn,p.x); xmx=std::max(xmx,p.x);
+                          ymn=std::min(ymn,p.y); ymx=std::max(ymx,p.y); }
+        gx0=xmn; gy0=ymn;
+        int side=std::min(1024, std::max(1,(int)std::sqrt((double)pts.size())));
+        gcell=std::max({(xmx-xmn)/side,(ymx-ymn)/side,1e-30});
+        gnx=(int)((xmx-xmn)/gcell)+1; gny=(int)((ymx-ymn)/gcell)+1;
+        cellEpoch.assign((size_t)gnx*gny, 0); cellEpochCtr=0;
+    };
+    // Cells the segment's line passes through, each haloed 3x3. Deduped with an
+    // epoch stamp (no per-segment sort) since this is called once per segment.
+    auto segCells=[&](double x0,double y0,double x1,double y1,std::vector<int>& cells){
+        cells.clear();
+        int ep=++cellEpochCtr;
+        double len=std::sqrt((x1-x0)*(x1-x0)+(y1-y0)*(y1-y0));
+        int ns=std::max(1,(int)(len/gcell)+1);
+        for(int s=0;s<=ns;s++){
+            double tt=(double)s/ns, x=x0+(x1-x0)*tt, y=y0+(y1-y0)*tt;
+            int cx=std::clamp((int)((x-gx0)/gcell),0,gnx-1);
+            int cy=std::clamp((int)((y-gy0)/gcell),0,gny-1);
+            for(int ddx=-1;ddx<=1;ddx++) for(int ddy=-1;ddy<=1;ddy++){
+                int nx=cx+ddx, ny=cy+ddy;
+                if(nx<0||nx>=gnx||ny<0||ny>=gny) continue;
+                int cidx=nx*gny+ny;
+                if(cellEpoch[cidx]!=ep){ cellEpoch[cidx]=ep; cells.push_back(cidx); }
+            }
+        }
+    };
+
     // 4. Split segments at near-coincident nodes (node lies on segment)
     {
+        // Points are not added in this section, so the point grid is built once.
+        rebuildGridDims();
+        std::vector<std::vector<int>> pgrid(gnx*gny);
+        for(int i=0;i<(int)pts.size();i++){
+            if(remap[i]!=i && i<nv) continue; // merged away
+            int cx=std::clamp((int)((pts[i].x-gx0)/gcell),0,gnx-1);
+            int cy=std::clamp((int)((pts[i].y-gy0)/gcell),0,gny-1);
+            pgrid[cx*gny+cy].push_back(i);
+        }
+        std::vector<int> cells;
         bool changed = true;
         while(changed){
             changed = false;
@@ -4220,8 +3936,15 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
                 // segment bounding box (expanded by tol)
                 double sx0=std::min(ax,bx)-tol, sx1=std::max(ax,bx)+tol;
                 double sy0=std::min(ay,by)-tol, sy1=std::max(ay,by)+tol;
-                for(int i=0; i<(int)pts.size(); i++){
+                // Lowest-index point on the segment, gathered from the grid cells
+                // the segment crosses (== the old linear scan's first match, since
+                // any on-segment point lies in one of those cells). Tracked
+                // directly so candidate dupes need neither sort nor unique.
+                segCells(ax,ay,bx,by,cells);
+                int bestI=-1;
+                for(int c:cells) for(int i:pgrid[c]){
                     if(i==v0 || i==v1) continue;
+                    if(bestI>=0 && i>=bestI) continue; // can't beat current best
                     if(remap[i] != i && i < nv) continue; // merged away
                     if(pts[i].x<sx0 || pts[i].x>sx1 || pts[i].y<sy0 || pts[i].y>sy1) continue;
                     double px=pts[i].x-ax, py=pts[i].y-ay;
@@ -4229,14 +3952,16 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
                     if(t <= tol/std::sqrt(len2) || t >= 1.0-tol/std::sqrt(len2)) continue;
                     double cross = dx*py - dy*px;
                     if(cross*cross > tol2*len2) continue;
-                    // Point i is on segment si — split it
+                    bestI=i;
+                }
+                if(bestI>=0){
+                    // Point bestI is on segment si — split it
                     Segment s2 = segs[si];
-                    segs[si].v1 = i;
-                    s2.v0 = i;
+                    segs[si].v1 = bestI;
+                    s2.v0 = bestI;
                     segs.push_back(s2);
                     splitSegs++;
                     changed = true;
-                    break;
                 }
             }
         }
@@ -4244,15 +3969,34 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
 
     // 5. Split segments at segment-segment intersections
     {
+        std::vector<int> cells;
         bool changed = true;
         while(changed){
             changed = false;
+            // Segments and points change on every split, so the segment grid is
+            // rebuilt each pass. Two intersecting segments share the crossing
+            // cell, so each is a candidate for the other.
+            rebuildGridDims();
+            std::vector<std::vector<int>> sgrid(gnx*gny);
+            for(int s=0;s<(int)segs.size();s++){
+                segCells(pts[segs[s].v0].x,pts[segs[s].v0].y,
+                         pts[segs[s].v1].x,pts[segs[s].v1].y,cells);
+                for(int c:cells) sgrid[c].push_back(s);
+            }
             for(int i=0; i<(int)segs.size() && !changed; i++){
                 double ax=pts[segs[i].v0].x, ay=pts[segs[i].v0].y;
                 double bx=pts[segs[i].v1].x, by=pts[segs[i].v1].y;
                 double ax0=std::min(ax,bx), ax1=std::max(ax,bx);
                 double ay0=std::min(ay,by), ay1=std::max(ay,by);
-                for(int j=i+1; j<(int)segs.size() && !changed; j++){
+                // Lowest j>i whose segment intersects i, gathered from the grid
+                // cells i crosses (an intersecting partner shares the crossing
+                // cell). Tracked directly so candidate dupes need no sort/unique.
+                segCells(ax,ay,bx,by,cells);
+                double d1x=bx-ax, d1y=by-ay;
+                int bestJ=-1; double ixBest=0, iyBest=0;
+                for(int c:cells) for(int j:sgrid[c]){
+                    if(j<=i) continue; // pairs with lower index handled as their own i
+                    if(bestJ>=0 && j>=bestJ) continue; // can't beat current best
                     // Skip if they share an endpoint
                     if(segs[i].v0==segs[j].v0 || segs[i].v0==segs[j].v1 ||
                        segs[i].v1==segs[j].v0 || segs[i].v1==segs[j].v1) continue;
@@ -4266,7 +4010,6 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
                     double cx=pts[segs[j].v0].x, cy=pts[segs[j].v0].y;
                     double dx2=pts[segs[j].v1].x, dy2=pts[segs[j].v1].y;
                     // Compute intersection
-                    double d1x=bx-ax, d1y=by-ay;
                     double d2x=dx2-cx, d2y=dy2-cy;
                     double denom=d1x*d2y-d1y*d2x;
                     if(std::abs(denom) < 1e-15) continue;
@@ -4274,7 +4017,10 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
                     double u=((cx-ax)*d1y-(cy-ay)*d1x)/denom;
                     if(t<=0 || t>=1 || u<=0 || u>=1) continue;
                     // Intersection at (ax+t*d1x, ay+t*d1y)
-                    double ix=ax+t*d1x, iy=ay+t*d1y;
+                    bestJ=j; ixBest=ax+t*d1x; iyBest=ay+t*d1y;
+                }
+                if(bestJ>=0){
+                    int j=bestJ; double ix=ixBest, iy=iyBest;
                     // Check if intersection is near an existing node
                     int nearNode=-1;
                     for(int k=0;k<(int)pts.size();k++){
@@ -4347,6 +4093,8 @@ void printUsage(){
 "  -Y    No Steiner points on boundary segments.\n"
 "  -n    Output .neigh file.\n"
 "  -R    Reorder nodes (Cuthill-McKee bandwidth reduction).\n"
+"  -g    Convert a FEMM file (.fem/.fee/.feh/.fec) to a standalone\n"
+"        <base>_pslg.poly and exit (no meshing).\n"
 "  -C    Clean PSLG: merge near-duplicate nodes, split intersecting\n"
 "        segments, remove duplicates. Optional tolerance (e.g. -C0.001);\n"
 "        default is bounding-box diagonal * 1e-6.\n"
@@ -4678,6 +4426,36 @@ int main(int argc, char* argv[]){
         if(!mesh.holes.empty()) std::cerr<<", "<<mesh.holes.size()<<" holes";
         if(!mesh.regions.empty()) std::cerr<<", "<<mesh.regions.size()<<" regions";
         std::cerr<<"\n";
+    }
+
+    if(opts.dump_poly){
+        // -g: convert a FEMM input into a standalone full-vertex .poly (the PSLG
+        // after arc discretization) and exit WITHOUT meshing.
+        if(!isFem){
+            std::cerr<<"Error: -g generates a .poly from a FEMM input file "
+                       "(.fem/.fee/.feh/.fec); '"<<inputFile<<"' is not one.\n";
+            return 1;
+        }
+        // Distinct name (<base>_pslg.poly) so it never clobbers an existing .poly.
+        std::string fn=base+"_pslg.poly";
+        std::ofstream f(fn);
+        f<<std::setprecision(17);
+        const int off = opts.zero_indexed?0:1;
+        f<<mesh.vertices.size()<<" 2 0 1\n";
+        for(size_t i=0;i<mesh.vertices.size();i++)
+            f<<(i+off)<<" "<<mesh.vertices[i].x<<" "<<mesh.vertices[i].y<<" "<<mesh.vertices[i].marker<<"\n";
+        f<<mesh.segments.size()<<" 1\n";
+        for(size_t i=0;i<mesh.segments.size();i++)
+            f<<(i+off)<<" "<<(mesh.segments[i].v0+off)<<" "<<(mesh.segments[i].v1+off)<<" "<<mesh.segments[i].marker<<"\n";
+        f<<mesh.holes.size()<<"\n";
+        for(size_t i=0;i<mesh.holes.size();i++)
+            f<<(i+off)<<" "<<mesh.holes[i].x<<" "<<mesh.holes[i].y<<"\n";
+        f<<mesh.regions.size()<<"\n";
+        for(size_t i=0;i<mesh.regions.size();i++)
+            f<<(i+off)<<" "<<mesh.regions[i].x<<" "<<mesh.regions[i].y<<" "<<mesh.regions[i].attrib<<" "<<mesh.regions[i].max_area<<"\n";
+        if(!opts.quiet) std::cerr<<"Wrote PSLG to "<<fn<<" ("<<mesh.vertices.size()<<" verts, "
+            <<mesh.segments.size()<<" segs, "<<mesh.holes.size()<<" holes, "<<mesh.regions.size()<<" regions)\n";
+        return 0;
     }
 
     runMeshPipeline(mesh, opts);

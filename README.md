@@ -185,10 +185,6 @@ SmartMesh and per-segment `MaxSideLength` constraints are translated to LFS
 values. PBC and AGE boundary types are detected from `BdryFormat` codes and
 handled automatically.
 
-Tangle can also be compiled as a library (`-DTANGLE_AS_LIBRARY`) and linked
-into applications. The `tangle_mesh_fem()` function takes a file base name,
-runs the full meshing pipeline, and returns the mesh in memory.
-
 ### Node Reordering — Cuthill-McKee Algorithm
 
 When the `-R` flag is given (or automatically for FEMM files), tangle
