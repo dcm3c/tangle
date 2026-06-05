@@ -436,7 +436,45 @@ def clean_pslg(mesh, tol, quiet):
     mesh.segments = good
     segs = mesh.segments
 
-    # 4. Split segments at near-coincident nodes
+    # Spatial grid shared by sections 4 and 5, replacing their O(S*N) / O(S^2)
+    # brute-force scans. A segment's candidate points/segments are gathered from
+    # the grid cells its supporting line passes through (sampled at <=1-cell
+    # steps, each expanded to a 3x3 halo so anything within tol of the line is
+    # covered) and processed lowest-index-first with the same tests as before,
+    # so the output is identical -- just without the quadratic scan. Grid side
+    # is capped at 1024, so cells >> tol always.
+    def grid_dims():
+        xmn = min(p.x for p in pts); xmx = max(p.x for p in pts)
+        ymn = min(p.y for p in pts); ymx = max(p.y for p in pts)
+        side = min(1024, max(1, int(math.sqrt(len(pts)))))
+        cell = max((xmx - xmn) / side, (ymx - ymn) / side, 1e-30)
+        return xmn, ymn, cell, int((xmx - xmn) / cell) + 1, int((ymx - ymn) / cell) + 1
+
+    def seg_cells(x0, y0, x1, y1, gx0, gy0, cell, gnx, gny):
+        # cells the segment's line passes through, each haloed 3x3 (deduped)
+        cells = set()
+        ns = max(1, int(math.hypot(x1 - x0, y1 - y0) / cell) + 1)
+        for s in range(ns + 1):
+            tt = s / ns
+            cx = min(max(int((x0 + (x1 - x0) * tt - gx0) / cell), 0), gnx - 1)
+            cy = min(max(int((y0 + (y1 - y0) * tt - gy0) / cell), 0), gny - 1)
+            for ddx in (-1, 0, 1):
+                for ddy in (-1, 0, 1):
+                    mx, my = cx + ddx, cy + ddy
+                    if 0 <= mx < gnx and 0 <= my < gny:
+                        cells.add(mx * gny + my)
+        return cells
+
+    # 4. Split segments at near-coincident nodes (node lies on segment).
+    # Points are not added in this section, so the point grid is built once.
+    gx0, gy0, cell, gnx, gny = grid_dims()
+    pgrid = {}
+    for i in range(len(pts)):
+        if i < nv and remap[i] != i:
+            continue  # merged away
+        cx = min(max(int((pts[i].x - gx0) / cell), 0), gnx - 1)
+        cy = min(max(int((pts[i].y - gy0) / cell), 0), gny - 1)
+        pgrid.setdefault(cx * gny + cy, []).append(i)
     changed = True
     while changed:
         changed = False
@@ -454,32 +492,48 @@ def clean_pslg(mesh, tol, quiet):
             sx1 = max(ax, bx) + tol
             sy0 = min(ay, by) - tol
             sy1 = max(ay, by) + tol
-            for i in range(len(pts)):
-                if i == v0 or i == v1:
-                    continue
-                if i < nv and remap[i] != i:
-                    continue
-                if pts[i].x < sx0 or pts[i].x > sx1 or pts[i].y < sy0 or pts[i].y > sy1:
-                    continue
-                px, py = pts[i].x - ax, pts[i].y - ay
-                t = (dx * px + dy * py) / len2
-                if t <= tol / sqrt_len or t >= 1.0 - tol / sqrt_len:
-                    continue
-                cross = dx * py - dy * px
-                if cross * cross > tol2 * len2:
-                    continue
-                # Point i is on segment si — split it
-                s2 = Segment(i, segs[si].v1, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
-                segs[si] = Segment(segs[si].v0, i, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
+            # lowest-index point lying on this segment, from the cells it crosses
+            best_i = -1
+            for c in seg_cells(ax, ay, bx, by, gx0, gy0, cell, gnx, gny):
+                for i in pgrid.get(c, ()):
+                    if i == v0 or i == v1:
+                        continue
+                    if best_i >= 0 and i >= best_i:
+                        continue
+                    if i < nv and remap[i] != i:
+                        continue
+                    if pts[i].x < sx0 or pts[i].x > sx1 or pts[i].y < sy0 or pts[i].y > sy1:
+                        continue
+                    px, py = pts[i].x - ax, pts[i].y - ay
+                    t = (dx * px + dy * py) / len2
+                    if t <= tol / sqrt_len or t >= 1.0 - tol / sqrt_len:
+                        continue
+                    cross = dx * py - dy * px
+                    if cross * cross > tol2 * len2:
+                        continue
+                    best_i = i
+            if best_i >= 0:
+                # Point best_i is on segment si — split it
+                s2 = Segment(best_i, segs[si].v1, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
+                segs[si] = Segment(segs[si].v0, best_i, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
                 segs.append(s2)
                 split_segs += 1
                 changed = True
-                break
 
-    # 5. Split segments at segment-segment intersections
+    # 5. Split segments at segment-segment intersections. Segments and points
+    # change on every split, so the segment grid is rebuilt each pass; two
+    # intersecting segments share the crossing cell, so each is a candidate for
+    # the other.
     changed = True
     while changed:
         changed = False
+        gx0, gy0, cell, gnx, gny = grid_dims()
+        sgrid = {}
+        for s in range(len(segs)):
+            for c in seg_cells(pts[segs[s].v0].x, pts[segs[s].v0].y,
+                               pts[segs[s].v1].x, pts[segs[s].v1].y,
+                               gx0, gy0, cell, gnx, gny):
+                sgrid.setdefault(c, []).append(s)
         for i in range(len(segs)):
             if changed:
                 break
@@ -487,35 +541,45 @@ def clean_pslg(mesh, tol, quiet):
             bx, by = pts[segs[i].v1].x, pts[segs[i].v1].y
             ax0, ax1 = min(ax, bx), max(ax, bx)
             ay0, ay1 = min(ay, by), max(ay, by)
-            for j in range(i + 1, len(segs)):
-                if changed:
-                    break
-                # Skip if they share an endpoint
-                if (segs[i].v0 in (segs[j].v0, segs[j].v1) or
-                    segs[i].v1 in (segs[j].v0, segs[j].v1)):
-                    continue
-                # Bounding box pre-filter
-                bx0 = min(pts[segs[j].v0].x, pts[segs[j].v1].x)
-                bx1 = max(pts[segs[j].v0].x, pts[segs[j].v1].x)
-                if ax1 < bx0 or ax0 > bx1:
-                    continue
-                by0 = min(pts[segs[j].v0].y, pts[segs[j].v1].y)
-                by1 = max(pts[segs[j].v0].y, pts[segs[j].v1].y)
-                if ay1 < by0 or ay0 > by1:
-                    continue
-                cx, cy = pts[segs[j].v0].x, pts[segs[j].v0].y
-                d2x, d2y = pts[segs[j].v1].x, pts[segs[j].v1].y
-                d1x, d1y = bx - ax, by - ay
-                ddx, ddy = d2x - cx, d2y - cy
-                denom = d1x * ddy - d1y * ddx
-                if abs(denom) < 1e-15:
-                    continue
-                t = ((cx - ax) * ddy - (cy - ay) * ddx) / denom
-                u = ((cx - ax) * d1y - (cy - ay) * d1x) / denom
-                if t <= 0 or t >= 1 or u <= 0 or u >= 1:
-                    continue
-                ix, iy = ax + t * d1x, ay + t * d1y
-                # Check if near existing node
+            d1x, d1y = bx - ax, by - ay
+            # lowest j>i whose segment intersects i, from the cells i crosses
+            best_j = -1
+            ix_best = iy_best = 0.0
+            for c in seg_cells(ax, ay, bx, by, gx0, gy0, cell, gnx, gny):
+                for j in sgrid.get(c, ()):
+                    if j <= i:
+                        continue
+                    if best_j >= 0 and j >= best_j:
+                        continue
+                    # Skip if they share an endpoint
+                    if (segs[i].v0 in (segs[j].v0, segs[j].v1) or
+                        segs[i].v1 in (segs[j].v0, segs[j].v1)):
+                        continue
+                    # Bounding box pre-filter
+                    bx0 = min(pts[segs[j].v0].x, pts[segs[j].v1].x)
+                    bx1 = max(pts[segs[j].v0].x, pts[segs[j].v1].x)
+                    if ax1 < bx0 or ax0 > bx1:
+                        continue
+                    by0 = min(pts[segs[j].v0].y, pts[segs[j].v1].y)
+                    by1 = max(pts[segs[j].v0].y, pts[segs[j].v1].y)
+                    if ay1 < by0 or ay0 > by1:
+                        continue
+                    cx, cy = pts[segs[j].v0].x, pts[segs[j].v0].y
+                    d2x, d2y = pts[segs[j].v1].x, pts[segs[j].v1].y
+                    ddx, ddy = d2x - cx, d2y - cy
+                    denom = d1x * ddy - d1y * ddx
+                    if abs(denom) < 1e-15:
+                        continue
+                    t = ((cx - ax) * ddy - (cy - ay) * ddx) / denom
+                    u = ((cx - ax) * d1y - (cy - ay) * d1x) / denom
+                    if t <= 0 or t >= 1 or u <= 0 or u >= 1:
+                        continue
+                    best_j = j
+                    ix_best, iy_best = ax + t * d1x, ay + t * d1y
+            if best_j >= 0:
+                j = best_j
+                ix, iy = ix_best, iy_best
+                # Check if intersection is near an existing node
                 near_node = -1
                 for k in range(len(pts)):
                     ex, ey = pts[k].x - ix, pts[k].y - iy
@@ -1005,278 +1069,6 @@ def enforce_constraints(mesh, quiet):
                   file=sys.stderr)
         mesh.segments = new_segs
 
-    for pass_num in range(5):
-        enforced = 0
-        for seg in mesh.segments:
-            u, v = seg.v0, seg.v1
-            if mesh.has_edge(u, v, v2t):
-                continue
-
-            success = False
-            for attempt in range(4):
-                if success:
-                    break
-                su = u if attempt % 2 == 0 else v
-                sv = v if attempt % 2 == 0 else u
-
-                sv_pert = Point(mesh.vertices[sv].x, mesh.vertices[sv].y)
-                if attempt >= 2:
-                    ddx = mesh.vertices[sv].x - mesh.vertices[su].x
-                    ddy = mesh.vertices[sv].y - mesh.vertices[su].y
-                    seg_len = math.sqrt(ddx * ddx + ddy * ddy)
-                    if seg_len > EPS:
-                        eps_pert = seg_len * 1e-8
-                        sv_pert.y += eps_pert
-
-                def orient_seg(p):
-                    return orient2d(mesh.vertices[su], sv_pert, p)
-
-                # Find starting triangle
-                start_tri = -1
-                cur_tri = -1
-                for ti in v2t[su]:
-                    if mesh.triangles[ti].v[0] >= 0:
-                        cur_tri = ti
-                        break
-                if cur_tri < 0:
-                    continue
-
-                # Check if sv is already adjacent
-                for ti in v2t[su]:
-                    t = mesh.triangles[ti]
-                    if t.v[0] < 0:
-                        continue
-                    for j in range(3):
-                        if t.v[j] == sv:
-                            success = True
-                            break
-                    if success:
-                        break
-                if success:
-                    continue
-
-                # Scan fan triangles
-                best_tri = -1
-                best_dot = -1e30
-                sdx = mesh.vertices[sv].x - mesh.vertices[su].x
-                sdy = mesh.vertices[sv].y - mesh.vertices[su].y
-                for ti in v2t[su]:
-                    t = mesh.triangles[ti]
-                    if t.v[0] < 0:
-                        continue
-                    lu = -1
-                    for j in range(3):
-                        if t.v[j] == su:
-                            lu = j
-                            break
-                    if lu < 0:
-                        continue
-                    right_v = t.v[(lu + 1) % 3]
-                    left_v = t.v[(lu + 2) % 3]
-                    o_right = orient_seg(mesh.vertices[right_v])
-                    o_left = orient_seg(mesh.vertices[left_v])
-                    if o_right >= 0 and o_left <= 0:
-                        mx = (mesh.vertices[right_v].x + mesh.vertices[left_v].x) / 2
-                        my = (mesh.vertices[right_v].y + mesh.vertices[left_v].y) / 2
-                        dmx = mx - mesh.vertices[su].x
-                        dmy = my - mesh.vertices[su].y
-                        dot = sdx * dmx + sdy * dmy
-                        if dot > best_dot:
-                            best_dot = dot
-                            best_tri = ti
-                start_tri = best_tri
-                if success:
-                    continue
-                if start_tri < 0:
-                    continue
-
-                # Walk from su to sv
-                st = mesh.triangles[start_tri]
-                local_u = -1
-                for j in range(3):
-                    if st.v[j] == su:
-                        local_u = j
-                a_v = st.v[(local_u + 1) % 3]
-                b_v = st.v[(local_u + 2) % 3]
-                oa = orient_seg(mesh.vertices[a_v])
-
-                if oa >= 0:
-                    first_above, first_below = a_v, b_v
-                else:
-                    first_above, first_below = b_v, a_v
-
-                crossed_tris = [start_tri]
-                above_chain = [first_above]
-                below_chain = [first_below]
-                bnd_edges = []
-
-                for j in range(3):
-                    ev0, ev1 = st.v[j], st.v[(j + 1) % 3]
-                    if (ev0 == first_above and ev1 == first_below) or \
-                       (ev0 == first_below and ev1 == first_above):
-                        continue
-                    nb = st.neighbors[j]
-                    oe = -1
-                    if nb >= 0:
-                        for k in range(3):
-                            if mesh.triangles[nb].neighbors[k] == start_tri:
-                                oe = k
-                                break
-                    bnd_edges.append((ev0, ev1, nb, oe))
-
-                reached_sv = False
-                for j in range(3):
-                    if st.v[j] == sv:
-                        reached_sv = True
-                        break
-
-                prev_above, prev_below = first_above, first_below
-                visited_tris = {start_tri}
-
-                while not reached_sv:
-                    last_tri2 = crossed_tris[-1]
-                    lt = mesh.triangles[last_tri2]
-                    next_tri = -1
-                    for j in range(3):
-                        ev0, ev1 = lt.v[j], lt.v[(j + 1) % 3]
-                        if (ev0 == prev_above and ev1 == prev_below) or \
-                           (ev0 == prev_below and ev1 == prev_above):
-                            next_tri = lt.neighbors[j]
-                            break
-                    if next_tri < 0 or next_tri in visited_tris:
-                        break
-                    visited_tris.add(next_tri)
-                    crossed_tris.append(next_tri)
-
-                    nt = mesh.triangles[next_tri]
-                    new_vert = -1
-                    for j in range(3):
-                        if nt.v[j] != prev_above and nt.v[j] != prev_below:
-                            new_vert = nt.v[j]
-                    if new_vert < 0:
-                        break
-
-                    if new_vert == sv:
-                        reached_sv = True
-                        for j in range(3):
-                            ev0, ev1 = nt.v[j], nt.v[(j + 1) % 3]
-                            if (ev0 == prev_above and ev1 == prev_below) or \
-                               (ev0 == prev_below and ev1 == prev_above):
-                                continue
-                            nb = nt.neighbors[j]
-                            oe = -1
-                            if nb >= 0:
-                                for k in range(3):
-                                    if mesh.triangles[nb].neighbors[k] == next_tri:
-                                        oe = k
-                                        break
-                            bnd_edges.append((ev0, ev1, nb, oe))
-                    else:
-                        side = orient_seg(mesh.vertices[new_vert])
-                        if side > 0:
-                            above_chain.append(new_vert)
-                            for j in range(3):
-                                ev0, ev1 = nt.v[j], nt.v[(j + 1) % 3]
-                                if (ev0 == prev_above and ev1 == prev_below) or \
-                                   (ev0 == prev_below and ev1 == prev_above):
-                                    continue
-                                if (ev0 == new_vert and ev1 == prev_below) or \
-                                   (ev0 == prev_below and ev1 == new_vert):
-                                    continue
-                                nb = nt.neighbors[j]
-                                oe = -1
-                                if nb >= 0:
-                                    for k in range(3):
-                                        if mesh.triangles[nb].neighbors[k] == next_tri:
-                                            oe = k
-                                            break
-                                bnd_edges.append((ev0, ev1, nb, oe))
-                            prev_above = new_vert
-                        else:
-                            below_chain.append(new_vert)
-                            for j in range(3):
-                                ev0, ev1 = nt.v[j], nt.v[(j + 1) % 3]
-                                if (ev0 == prev_above and ev1 == prev_below) or \
-                                   (ev0 == prev_below and ev1 == prev_above):
-                                    continue
-                                if (ev0 == prev_above and ev1 == new_vert) or \
-                                   (ev0 == new_vert and ev1 == prev_above):
-                                    continue
-                                nb = nt.neighbors[j]
-                                oe = -1
-                                if nb >= 0:
-                                    for k in range(3):
-                                        if mesh.triangles[nb].neighbors[k] == next_tri:
-                                            oe = k
-                                            break
-                                bnd_edges.append((ev0, ev1, nb, oe))
-                            prev_below = new_vert
-
-                if not reached_sv:
-                    continue
-
-                above_poly = [su] + above_chain + [sv]
-                below_poly = [sv] + below_chain[::-1] + [su]
-
-                above_tris = ear_clip(above_poly)
-                below_tris = ear_clip(below_poly)
-
-                total_new = len(above_tris) + len(below_tris)
-                total_old = len(crossed_tris)
-                if total_new == 0:
-                    continue
-
-                crossed_tris.sort()
-                slots = []
-                for i in range(min(total_old, total_new)):
-                    slots.append(crossed_tris[i])
-                while len(slots) < total_new:
-                    slots.append(len(mesh.triangles))
-                    mesh.triangles.append(Triangle())
-                for i in range(total_new, total_old):
-                    mesh.triangles[crossed_tris[i]].v = [-1, -1, -1]
-                    mesh.triangles[crossed_tris[i]].neighbors = [-1, -1, -1]
-
-                all_new = above_tris + below_tris
-                for i in range(total_new):
-                    s = slots[i]
-                    mesh.triangles[s].v = list(all_new[i])
-                    mesh.triangles[s].neighbors = [-1, -1, -1]
-                    mesh.triangles[s].region_attrib = 0
-                    mesh.triangles[s].region_max_area = -1
-                    mesh.triangles[s].marker = 0
-
-                # Wire internal adjacency
-                edge_map = {}
-                for i in range(total_new):
-                    s = slots[i]
-                    t = mesh.triangles[s]
-                    for j in range(3):
-                        key = edge_key(t.v[j], t.v[(j + 1) % 3])
-                        if key in edge_map:
-                            os, oe = edge_map[key]
-                            t.neighbors[j] = os
-                            mesh.triangles[os].neighbors[oe] = s
-                            del edge_map[key]
-                        else:
-                            edge_map[key] = (s, j)
-
-                # Wire boundary edges
-                for be in bnd_edges:
-                    key = edge_key(be[0], be[1])
-                    if key in edge_map:
-                        s, j = edge_map[key]
-                        mesh.triangles[s].neighbors[j] = be[2]
-                        if be[2] >= 0 and be[3] >= 0:
-                            mesh.triangles[be[2]].neighbors[be[3]] = s
-
-                v2t = build_v2t()
-                success = True
-                enforced += 1
-
-        if enforced == 0 and pass_num > 0:
-            break
-
     # Direct adjacency check: flip-based
     mesh.rebuild_adjacency()
     v2t = build_v2t()
@@ -1346,12 +1138,7 @@ def enforce_constraints(mesh, quiet):
                 if found:
                     break
 
-    # Edge flipping and cavity fallback for remaining segments
-    seg_edges = set()
-    for s2 in mesh.segments:
-        if mesh.has_edge(s2.v0, s2.v1, v2t):
-            seg_edges.add(edge_key(s2.v0, s2.v1))
-
+    # Cavity fallback for the few segments the flip block couldn't enforce
     def segs_cross(v1, v2, v3, v4):
         d1 = orient2d(mesh.vertices[v1], mesh.vertices[v2], mesh.vertices[v3])
         d2 = orient2d(mesh.vertices[v1], mesh.vertices[v2], mesh.vertices[v4])
@@ -1366,181 +1153,6 @@ def enforce_constraints(mesh, quiet):
     for seg in mesh.segments:
         su, sv = seg.v0, seg.v1
         if mesh.has_edge(su, sv, v2t):
-            continue
-
-        # Walk from su toward sv collecting crossing edges, then flip them
-        for attempt in range(2):
-            if mesh.has_edge(su, sv, v2t):
-                break
-            wu = su if attempt == 0 else sv
-            wv = sv if attempt == 0 else su
-
-            # Find starting triangle in wu's fan that straddles the segment
-            sdx = mesh.vertices[wv].x - mesh.vertices[wu].x
-            sdy = mesh.vertices[wv].y - mesh.vertices[wu].y
-            start_tri = -1
-            for ti in v2t[wu]:
-                t = mesh.triangles[ti]
-                if t.v[0] < 0:
-                    continue
-                lu = -1
-                for j in range(3):
-                    if t.v[j] == wu:
-                        lu = j
-                        break
-                if lu is None or lu < 0:
-                    continue
-                right, left = t.v[(lu + 1) % 3], t.v[(lu + 2) % 3]
-                o_r = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[right])
-                o_l = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[left])
-                if o_r >= 0 and o_l <= 0:
-                    mx = (mesh.vertices[right].x + mesh.vertices[left].x) * 0.5
-                    my = (mesh.vertices[right].y + mesh.vertices[left].y) * 0.5
-                    if sdx * (mx - mesh.vertices[wu].x) + sdy * (my - mesh.vertices[wu].y) > 0:
-                        start_tri = ti
-                        break
-            if start_tri < 0:
-                continue
-
-            # Walk to collect crossing edges
-            st = mesh.triangles[start_tri]
-            lu = -1
-            for j in range(3):
-                if st.v[j] == wu:
-                    lu = j
-                    break
-            ra, rb = st.v[(lu + 1) % 3], st.v[(lu + 2) % 3]
-            oa = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[ra])
-            prev_above = ra if oa >= 0 else rb
-            prev_below = rb if oa >= 0 else ra
-
-            flip_queue = deque()
-            flip_queue.append(edge_key(prev_above, prev_below))
-
-            visited = {start_tri}
-            cur_tri = start_tri
-            reached = False
-            for _step in range(len(mesh.triangles) * 2):
-                if reached:
-                    break
-                next_tri = -1
-                ct = mesh.triangles[cur_tri]
-                for j in range(3):
-                    ev0, ev1 = ct.v[j], ct.v[(j + 1) % 3]
-                    if (ev0 == prev_above and ev1 == prev_below) or \
-                       (ev0 == prev_below and ev1 == prev_above):
-                        next_tri = ct.neighbors[j]
-                        break
-                if next_tri < 0 or next_tri in visited:
-                    break
-                visited.add(next_tri)
-                cur_tri = next_tri
-
-                nt = mesh.triangles[next_tri]
-                new_vert = -1
-                for j in range(3):
-                    if nt.v[j] != prev_above and nt.v[j] != prev_below:
-                        new_vert = nt.v[j]
-                        break
-                if new_vert < 0:
-                    break
-                if new_vert == wv:
-                    reached = True
-                    break
-
-                side = orient2d(mesh.vertices[wu], mesh.vertices[wv], mesh.vertices[new_vert])
-                if side > 0:
-                    flip_queue.append(edge_key(new_vert, prev_below))
-                    prev_above = new_vert
-                else:
-                    flip_queue.append(edge_key(prev_above, new_vert))
-                    prev_below = new_vert
-            if not reached:
-                continue
-
-            # Flip crossing edges (standard CDT flip algorithm)
-            max_iter = len(flip_queue) * len(flip_queue) + 10
-            itr = 0
-            while flip_queue and itr < max_iter:
-                itr += 1
-                ea, eb = flip_queue.popleft()
-                if not segs_cross(su, sv, ea, eb):
-                    continue
-                if edge_key(ea, eb) in seg_edges:
-                    continue
-
-                # Find two triangles sharing edge (ea, eb) via v2t
-                ti_found, nb_found = -1, -1
-                ti_edge, nb_edge2 = -1, -1
-                for t_idx in v2t[ea]:
-                    tr = mesh.triangles[t_idx]
-                    if tr.v[0] < 0:
-                        continue
-                    for j in range(3):
-                        if (tr.v[j] == ea and tr.v[(j + 1) % 3] == eb) or \
-                           (tr.v[j] == eb and tr.v[(j + 1) % 3] == ea):
-                            if ti_found < 0:
-                                ti_found, ti_edge = t_idx, j
-                            else:
-                                nb_found, nb_edge2 = t_idx, j
-                if ti_found < 0 or nb_found < 0:
-                    continue
-
-                p_v = mesh.triangles[ti_found].v[(ti_edge + 2) % 3]
-                q_v = mesh.triangles[nb_found].v[(nb_edge2 + 2) % 3]
-
-                # Check convexity
-                co1 = orient2d(mesh.vertices[p_v], mesh.vertices[ea], mesh.vertices[q_v])
-                co2 = orient2d(mesh.vertices[p_v], mesh.vertices[q_v], mesh.vertices[eb])
-                if co1 < 0 or co2 < 0:
-                    flip_queue.append((ea, eb))  # defer
-                    continue
-
-                # Flip (ea, eb) -> (p_v, q_v)
-                T1, T2 = mesh.triangles[ti_found], mesh.triangles[nb_found]
-                n_pa, n_bp = -1, -1
-                for k in range(3):
-                    e0, e1 = T1.v[k], T1.v[(k + 1) % 3]
-                    if (e0 == p_v and e1 == ea) or (e0 == ea and e1 == p_v):
-                        n_pa = T1.neighbors[k]
-                    if (e0 == eb and e1 == p_v) or (e0 == p_v and e1 == eb):
-                        n_bp = T1.neighbors[k]
-                n_aq, n_qb = -1, -1
-                for k in range(3):
-                    e0, e1 = T2.v[k], T2.v[(k + 1) % 3]
-                    if (e0 == ea and e1 == q_v) or (e0 == q_v and e1 == ea):
-                        n_aq = T2.neighbors[k]
-                    if (e0 == q_v and e1 == eb) or (e0 == eb and e1 == q_v):
-                        n_qb = T2.neighbors[k]
-                T1.v = [p_v, ea, q_v]
-                T1.neighbors = [n_pa, n_aq, nb_found]
-                T2.v = [p_v, q_v, eb]
-                T2.neighbors = [ti_found, n_qb, n_bp]
-                if n_aq >= 0:
-                    for k in range(3):
-                        if mesh.triangles[n_aq].neighbors[k] == nb_found:
-                            mesh.triangles[n_aq].neighbors[k] = ti_found
-                            break
-                if n_bp >= 0:
-                    for k in range(3):
-                        if mesh.triangles[n_bp].neighbors[k] == ti_found:
-                            mesh.triangles[n_bp].neighbors[k] = nb_found
-                            break
-
-                # Incremental v2t: T1 lost eb gained q_v, T2 lost ea gained p_v
-                if ti_found in v2t[eb]:
-                    v2t[eb].remove(ti_found)
-                if nb_found in v2t[ea]:
-                    v2t[ea].remove(nb_found)
-                v2t[q_v].append(ti_found)
-                v2t[p_v].append(nb_found)
-
-                # If new edge still crosses, re-enqueue
-                if segs_cross(su, sv, p_v, q_v):
-                    flip_queue.append(edge_key(p_v, q_v))
-
-        if mesh.has_edge(su, sv, v2t):
-            seg_edges.add(edge_key(su, sv))
             continue
 
         # Cavity-based fallback
@@ -1710,9 +1322,6 @@ def enforce_constraints(mesh, quiet):
                                         ot.neighbors[k] = s
                                         break
                 v2t = build_v2t()
-
-        if mesh.has_edge(su, sv, v2t):
-            seg_edges.add(edge_key(su, sv))
 
     # Count and return remaining missing segments
     miss = 0
