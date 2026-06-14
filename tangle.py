@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4
-2 Jun 2026
+Version 0.4.1
+12 Jun 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -50,8 +50,17 @@ import time
 import bisect
 from collections import deque
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, getcontext
 from heapq import heappush, heappop
+
+# Exact-predicate fallback precision.  orient2d/in_circle fall back to Decimal
+# when the double filter is inconclusive; the products there need ~34 (orient2d)
+# to ~51 (in_circle) significant digits to be exact, well above Decimal's default
+# 28 (~93 bits, which is BELOW the float128 tangle.cpp found insufficient for
+# mixed-scale coords -- see f0854c1, which moved C++ to float256 ~245 bits).
+# 80 digits comfortably exceeds float256's precision; it only costs in the rare
+# fallback (the double filter handles >99.9% of calls).
+getcontext().prec = 80
 
 # Base relative tolerance.  EPS is scaled to the bounding-box diagonal in
 # build_delaunay(); EPS_SCALE controls that ratio and is also used directly
@@ -380,13 +389,19 @@ def clean_pslg(mesh, tol, quiet):
     segs = mesh.segments
     nv = len(pts)
 
-    # Compute auto tolerance if not specified
+    # Compute auto tolerance if not specified.  tol == -1 is the -C default
+    # (bb_diag * CLOSE_ENOUGH); tol <= -2 is the always-on hygiene pass run for
+    # every PSLG, with an essentially-exact tolerance (bb_diag * 1e-12, ~4 decimal
+    # digits above double ULP) that merges only true duplicates and geometry no
+    # refinement could ever resolve, while still splitting crossing segments (the
+    # intersection test is tolerance-independent).
     if tol < 0:
         min_x = min(p.x for p in pts)
         max_x = max(p.x for p in pts)
         min_y = min(p.y for p in pts)
         max_y = max(p.y for p in pts)
-        tol = math.sqrt((max_x - min_x)**2 + (max_y - min_y)**2) * CLOSE_ENOUGH
+        bb_diag = math.sqrt((max_x - min_x)**2 + (max_y - min_y)**2)
+        tol = bb_diag * (1e-12 if tol <= -2.0 else CLOSE_ENOUGH)
     tol2 = tol * tol
 
     merged_nodes = 0
@@ -568,7 +583,12 @@ def clean_pslg(mesh, tol, quiet):
                     d2x, d2y = pts[segs[j].v1].x, pts[segs[j].v1].y
                     ddx, ddy = d2x - cx, d2y - cy
                     denom = d1x * ddy - d1y * ddx
-                    if abs(denom) < 1e-15:
+                    # Parallel-rejection must be SCALE-FREE: denom scales with the
+                    # product of the segment lengths, so a fixed 1e-15 cutoff
+                    # silently skipped genuine crossings between short near-parallel
+                    # segments (and was needlessly far from underflow for long ones).
+                    dmag = abs(d1x * ddy) + abs(d1y * ddx)
+                    if dmag == 0.0 or abs(denom) < 1e-12 * dmag:
                         continue
                     t = ((cx - ax) * ddy - (cy - ay) * ddx) / denom
                     u = ((cx - ax) * d1y - (cy - ay) * d1x) / denom
@@ -662,6 +682,7 @@ def build_delaunay(mesh):
     last_tri = 0
     visit_epoch = []
     epoch = 0
+    skipped_pts = 0
 
     for ii in range(n):
         pidx = order[ii]
@@ -703,7 +724,27 @@ def build_delaunay(mesh):
                     start_tri = i
                     break
         if start_tri < 0:
+            skipped_pts += 1
             continue
+
+        # Precise re-walk with exact orientation tests (the Bowyer-Watson
+        # analogue of insert_point_lawson's exact refinement): the EPS-tolerant
+        # walk above can stop at a triangle the point is actually just OUTSIDE
+        # of, and near a vertex the circumcircle of that triangle can exclude the
+        # point -- yielding a falsely empty cavity below.
+        for _ in range(len(tris)):
+            t = tris[start_tri]
+            neg_edge = -1
+            for j in range(3):
+                if orient2d(pts[t.v[j]], pts[t.v[(j + 1) % 3]], p) < 0.0:
+                    neg_edge = j
+                    break
+            if neg_edge < 0:
+                break  # exact containment (or on edge)
+            nb = t.neighbors[neg_edge]
+            if nb < 0:
+                break  # hull edge -- accept current
+            start_tri = nb
 
         # BFS cavity (epoch-based visited to avoid per-point allocation)
         epoch += 1
@@ -725,8 +766,16 @@ def build_delaunay(mesh):
                     if t.neighbors[j] >= 0 and visit_epoch[t.neighbors[j]] != epoch:
                         stk.append(t.neighbors[j])
 
+        # Empty cavity: with exact predicates, a point strictly inside any
+        # triangle is strictly inside its circumcircle, so an empty cavity means
+        # the point coincides with an existing vertex (or the EPS walk mislocated
+        # it).  Leave it unconnected, like Triangle's duplicate-vertex handling.
+        # (A previous revision force-fanned the located triangle here, which
+        # emitted zero-area triangles for exact duplicates and overlapping
+        # triangles for mislocations -- a corrupted triangulation either way.)
         if not bad:
-            bad.append(start_tri)
+            skipped_pts += 1
+            continue
 
         # Collect boundary polygon
         bad_set = set(bad)
@@ -743,6 +792,21 @@ def build_delaunay(mesh):
                                 oe = k
                                 break
                     poly.append((t.v[j], t.v[(j + 1) % 3], nb, oe))
+
+        # Strict-CCW refusal (the Bowyer-Watson analogue of insert_point_lawson's
+        # guard): every fan triangle must come out strictly positive, which exact
+        # predicates guarantee for a correctly located point.  A violation means a
+        # duplicate or mislocated point slipped past the checks above -- refuse the
+        # whole insertion BEFORE destroying any cavity triangle, leaving the mesh
+        # valid and the vertex unconnected.
+        fan_ok = True
+        for e in poly:
+            if orient2d(pts[e[0]], pts[e[1]], p) <= 0:
+                fan_ok = False
+                break
+        if not fan_ok:
+            skipped_pts += 1
+            continue
 
         n_new = len(poly)
         bad.sort()
@@ -763,8 +827,7 @@ def build_delaunay(mesh):
             tris[s].region_attrib = 0
             tris[s].region_max_area = -1
             tris[s].marker = 0
-            if orient2d(pts[tris[s].v[0]], pts[tris[s].v[1]], pts[tris[s].v[2]]) < 0:
-                tris[s].v[0], tris[s].v[1] = tris[s].v[1], tris[s].v[0]
+            # Strictly CCW by the fan guard above -- no orientation fix-up.
 
         # Wire outer adjacency
         for i in range(n_new):
@@ -797,6 +860,11 @@ def build_delaunay(mesh):
                 else:
                     pidx_edges[other] = (s, j)
         last_tri = slots[0]
+
+    if skipped_pts > 0:
+        sys.stderr.write(
+            f"Warning: {skipped_pts} point{'' if skipped_pts == 1 else 's'} "
+            "could not be inserted (duplicate or unlocatable); left unconnected.\n")
 
     # Remove dead triangles and super-triangle vertices
     keep = [False] * len(tris)
@@ -961,57 +1029,52 @@ def enforce_constraints(mesh, quiet):
         return v2t
 
     def ear_clip(poly_verts):
+        # Strict ear clipping (mirrors C++ earClip): clip only well-formed empty
+        # ears, and reject an ear when a vertex lies ON its new diagonal (the
+        # >= 0 term) -- clipping it would orphan that vertex as a hanging node
+        # (FEMM's near-collinear corner twins land exactly there). No relaxed
+        # pass / fan fallback. On a stall it returns an INCOMPLETE result; the
+        # caller checks the triangle count (a simple m-gon -> m-2 triangles) and
+        # declines, routing the segment to the midpoint-split + rebuild fallback.
         result = []
         p = list(poly_verts)
         while len(p) > 3:
             clipped = False
             nn = len(p)
-            for pass2 in range(2):
-                if clipped:
-                    break
-                tol = 0.0 if pass2 == 0 else -1e-8
-                for i in range(nn):
-                    prev_v = p[(i + nn - 1) % nn]
-                    cur_v = p[i]
-                    next_v = p[(i + 1) % nn]
-                    if orient2d(mesh.vertices[prev_v], mesh.vertices[cur_v],
-                                mesh.vertices[next_v]) <= tol:
+            for i in range(nn):
+                prev_v = p[(i + nn - 1) % nn]
+                cur_v = p[i]
+                next_v = p[(i + 1) % nn]
+                if orient2d(mesh.vertices[prev_v], mesh.vertices[cur_v],
+                            mesh.vertices[next_v]) <= 0.0:
+                    continue
+                blocked = False
+                for k in range(nn):
+                    if k in ((i + nn - 1) % nn, i, (i + 1) % nn):
                         continue
-                    inside = False
-                    for k in range(nn):
-                        if k in ((i + nn - 1) % nn, i, (i + 1) % nn):
-                            continue
-                        vi = p[k]
-                        if (orient2d(mesh.vertices[prev_v], mesh.vertices[cur_v],
-                                     mesh.vertices[vi]) > 0 and
-                            orient2d(mesh.vertices[cur_v], mesh.vertices[next_v],
-                                     mesh.vertices[vi]) > 0 and
-                            orient2d(mesh.vertices[next_v], mesh.vertices[prev_v],
-                                     mesh.vertices[vi]) > 0):
-                            inside = True
-                            break
-                    if inside:
-                        continue
-                    result.append([prev_v, cur_v, next_v])
-                    p.pop(i)
-                    clipped = True
-                    break
+                    vi = p[k]
+                    if (orient2d(mesh.vertices[prev_v], mesh.vertices[cur_v],
+                                 mesh.vertices[vi]) > 0 and
+                        orient2d(mesh.vertices[cur_v], mesh.vertices[next_v],
+                                 mesh.vertices[vi]) > 0 and
+                        orient2d(mesh.vertices[next_v], mesh.vertices[prev_v],
+                                 mesh.vertices[vi]) >= 0):
+                        blocked = True
+                        break
+                if blocked:
+                    continue
+                result.append([prev_v, cur_v, next_v])
+                p.pop(i)
+                clipped = True
+                break
             if not clipped:
                 break
-        if len(p) >= 3:
-            if len(p) == 3:
-                o = orient2d(mesh.vertices[p[0]], mesh.vertices[p[1]], mesh.vertices[p[2]])
-                if o > 0:
-                    result.append([p[0], p[1], p[2]])
-                elif o < 0:
-                    result.append([p[0], p[2], p[1]])
-            else:
-                for i in range(1, len(p) - 1):
-                    o = orient2d(mesh.vertices[p[0]], mesh.vertices[p[i]], mesh.vertices[p[i + 1]])
-                    if o > 0:
-                        result.append([p[0], p[i], p[i + 1]])
-                    elif o < 0:
-                        result.append([p[0], p[i + 1], p[i]])
+        if len(p) == 3:
+            o = orient2d(mesh.vertices[p[0]], mesh.vertices[p[1]], mesh.vertices[p[2]])
+            if o > 0:
+                result.append([p[0], p[1], p[2]])
+            elif o < 0:
+                result.append([p[0], p[2], p[1]])
         return result
 
     v2t = build_v2t()
@@ -1270,9 +1333,18 @@ def enforce_constraints(mesh, quiet):
                         if i == su_idx:
                             break
                         i = (i + 1) % nn
-                    new_tris_cav = ear_clip(poly1) + ear_clip(poly2)
+                    # Accept only COMPLETE triangulations (m-gon -> m-2 tris). A
+                    # short count means ear_clip declined a degenerate cavity;
+                    # leave new_tris_cav empty so the segment falls through to the
+                    # midpoint-split + rebuild fallback.
+                    t1, t2 = ear_clip(poly1), ear_clip(poly2)
+                    if len(t1) == max(0, len(poly1) - 2) and len(t2) == max(0, len(poly2) - 2):
+                        new_tris_cav = t1 + t2
+                    else:
+                        new_tris_cav = []
                 else:
-                    new_tris_cav = ear_clip(poly_chain)
+                    tt = ear_clip(poly_chain)
+                    new_tris_cav = tt if len(tt) == max(0, len(poly_chain) - 2) else []
 
             if new_tris_cav:
                 crossed_vec = sorted(crossed_set)
@@ -1525,6 +1597,18 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dis
             mesh.vertices.pop()
             return -1
 
+    # Output-orientation validation (parity with tangle.cpp 156f54e): every
+    # triangle a split creates must be strictly CCW (positive area). The locate
+    # walk can accept a boundary triangle for a point actually OUTSIDE the domain;
+    # splitting there manufactures an inverted triangle, and one invalid triangle
+    # corrupts every circumcenter / flip / adjacency built on it. Refuse any such
+    # split (the bad triangle is tolerated). Exact predicate => no inverted or
+    # degenerate triangle can ever enter the mesh.
+    def tri_ccw(a, b, c):
+        return orient2d_xy(mesh.vertices[a].x, mesh.vertices[a].y,
+                           mesh.vertices[b].x, mesh.vertices[b].y,
+                           mesh.vertices[c].x, mesh.vertices[c].y) > 0.0
+
     # Inherit region from the containing triangle
     reg_attr = t.region_attrib
     reg_area = t.region_max_area
@@ -1534,6 +1618,9 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dis
     if on_edge < 0:
         # Interior: split triangle into 3
         v0, v1, v2 = t.v[0], t.v[1], t.v[2]
+        if not (tri_ccw(v0, v1, pidx) and tri_ccw(v1, v2, pidx) and tri_ccw(v2, v0, pidx)):
+            mesh.vertices.pop()
+            return -1
         n0, n1, n2 = t.neighbors[0], t.neighbors[1], t.neighbors[2]
 
         t0 = ti
@@ -1573,6 +1660,9 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dis
 
         if n_ab < 0:
             # Boundary edge: split 1 triangle into 2
+            if not (tri_ccw(va, pidx, vc) and tri_ccw(pidx, vb, vc)):
+                mesh.vertices.pop()
+                return -1
             t0 = ti
             t1 = len(mesh.triangles)
             mesh.triangles.append(Triangle())
@@ -1603,6 +1693,16 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dis
                 return -1
 
             vd = tn.v[(je + 2) % 3]
+            # Coincidence check for the neighbor's apex: the on-edge split creates
+            # edges to vd, but the rejection loop above only tested the CONTAINING
+            # triangle's vertices.  A point within the reject radius of vd passed
+            # that test, and the strict-CCW guard below accepts any sub-EPS-thin
+            # but positively-oriented sliver -- a legal-but-degenerate triangle at vd.
+            dxv = mesh.vertices[vd].x - np.x
+            dyv = mesh.vertices[vd].y - np.y
+            if dxv * dxv + dyv * dyv < rej_r2:
+                mesh.vertices.pop()
+                return -1
             if tn.v[je] == vb and tn.v[(je + 1) % 3] == va:
                 n_avd = tn.neighbors[(je + 1) % 3]
                 n_dvb = tn.neighbors[(je + 2) % 3]
@@ -1610,6 +1710,10 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dis
                 n_dvb = tn.neighbors[(je + 1) % 3]
                 n_avd = tn.neighbors[(je + 2) % 3]
 
+            if not (tri_ccw(va, pidx, vc) and tri_ccw(pidx, vb, vc) and
+                    tri_ccw(vb, pidx, vd) and tri_ccw(pidx, va, vd)):
+                mesh.vertices.pop()
+                return -1
             # Inherit region from the neighbor triangle
             reg_attr2 = tn.region_attrib
             reg_area2 = tn.region_max_area
@@ -1798,7 +1902,12 @@ def tri_metric(mesh, ti, min_ang_threshold, global_max_a, use_region_area,
 def refine_quality(mesh, opts, n_input_verts):
     if not opts.quality and not opts.area_limit:
         return
-    min_ang_val = opts.min_angle + 0.1 if opts.quality else 0.0
+    # Refine to exactly the requested angle.  (An earlier +0.1 deg overshoot
+    # "for floating-point precision" only added needless triangles: the refiner
+    # never stops at a triangle below the threshold it tests, so the output
+    # minimum can fall short by at most rounding in the angle evaluation, orders
+    # of magnitude below 0.1 deg.)
+    min_ang_val = opts.min_angle if opts.quality else 0.0
     cos_min_ang = math.cos(min_ang_val * math.pi / 180.0) if min_ang_val > 0 else -1.0
     global_max_a = opts.max_area if opts.area_limit else -1.0
     use_region_area = opts.area_limit
@@ -2149,11 +2258,49 @@ def refine_quality(mesh, opts, n_input_verts):
                         return si
         return -1
 
-    # Priority queue (min-heap): order by SHORTEST EDGE first.  The key is the
-    # bad triangle's smallest squared edge length, so the triangle with the
-    # shortest edge is processed first (Shewchuk-style; well-graded meshes at
-    # Triangle-class triangle counts).  Tuple = (minEdge2, idx, generation, retry).
-    REQUEUE_CAP = 2     # capped badIdx re-queue after an encroachment split
+    def walk_blocked(start_tri, px, py):
+        """Walk straight from start_tri toward (px,py); return the segment index
+        of the first CONSTRAINED edge the walk must cross (the candidate is
+        hidden behind it and encroaches it, even one outside the domain), -1 if
+        the point is reachable (visible), or -2 if the walk fails structurally
+        (drop the candidate).  Without this, blocked candidates fail insertion
+        and their bad triangles are silently dropped (e.g. a vertex a few microns
+        off a constrained segment left a 0.107-degree sliver untouched)."""
+        ti = start_tri
+        for _ in range(len(mesh.triangles)):
+            if ti < 0 or ti >= len(mesh.triangles):
+                return -2
+            t = mesh.triangles[ti]
+            if t.v[0] < 0:
+                return -2
+            exit_edge = -1
+            for j in range(3):
+                va = t.v[j]
+                vb = t.v[(j + 1) % 3]
+                if orient2d_xy(mesh.vertices[va].x, mesh.vertices[va].y,
+                               mesh.vertices[vb].x, mesh.vertices[vb].y,
+                               px, py) < 0.0:
+                    exit_edge = j
+                    break
+            if exit_edge < 0:
+                return -1  # point inside (or on boundary of) ti: visible
+            va = t.v[exit_edge]
+            vb = t.v[(exit_edge + 1) % 3]
+            if edge_key(va, vb) in constrained_edges:
+                return edge_to_seg.get(edge_key(va, vb), -2)
+            ti = t.neighbors[exit_edge]
+            if ti < 0:
+                return -2  # unconstrained hull edge (shouldn't happen in a PSLG)
+        return -2
+
+    # Priority queue (min-heap): order by SHORTEST EDGE first = smallest squared
+    # edge length, the order under which off-center insertion guarantees growth
+    # (Ungor).  Tuple = (key, idx, generation, retry).  (A scale-gated switch to
+    # worst-angle ordering for tiny triangles used to live here; with the
+    # circumcenter test below made scale-free it is unnecessary and actively
+    # harmful -- it broke the smallest-first growth guarantee and carpeted
+    # sub-tiny features at -q33.)
+    REQUEUE_CAP = 4     # capped badIdx re-queue after an encroachment split
     GUARD_FACTOR = 0.5  # too-close-insertion guard: reject radius factor
 
     def prio_key(mr):
@@ -2217,9 +2364,12 @@ def refine_quality(mesh, opts, n_input_verts):
                     edge_key(va, vc_v) in constrained_edges):
                     dbg_skip += 1
                     continue
-            # For tiny triangles (all edges < bboxDiag * CLOSE_ENOUGH),
-            # accept a reduced minimum angle instead of the full threshold.
-            tiny_len2 = bb_diag * CLOSE_ENOUGH
+            # For tiny triangles (all edges < bb_diag * 1e-9, i.e. at the floor
+            # where coordinates have ~7 ULPs of room left), accept a reduced
+            # minimum angle.  This engages only for EXACTLY (or near-exactly)
+            # coincident input geometry that splitting cannot resolve -- anything
+            # with a representable gap is refined to full quality instead.
+            tiny_len2 = bb_diag * 1e-9
             tiny_len2 *= tiny_len2
             if la2 < tiny_len2 and lb2 < tiny_len2 and lc2 < tiny_len2:
                 ang = min_angle(a, b, c)
@@ -2233,7 +2383,12 @@ def refine_quality(mesh, opts, n_input_verts):
             xdo, ydo = b.x - a.x, b.y - a.y
             xao, yao = c.x - a.x, c.y - a.y
             D = 2.0 * (xdo * yao - ydo * xao)
-            if abs(D) < EPS:
+            # Degenerate-circumcenter fallback must be SCALE-FREE: D scales like
+            # edge^2, so an absolute EPS classified every triangle below ~sqrt(EPS)
+            # as degenerate and inserted its centroid -> guaranteed insertion-radius
+            # descent (a carpet) once refinement reaches small scales.
+            d_mag = abs(xdo * yao) + abs(ydo * xao)
+            if abs(D) < 1e-12 * d_mag or d_mag == 0.0:
                 tcx, tcy = (a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0
             else:
                 # dodist=xdo²+ydo²=lc2, aodist=xao²+yao²=lb2 (from tri_metric)
@@ -2262,8 +2417,21 @@ def refine_quality(mesh, opts, n_input_verts):
             tcx = (a.x + b.x + c.x) / 3.0
             tcy = (a.y + b.y + c.y) / 3.0
 
-        # Pre-insertion encroachment check
+        # Pre-insertion encroachment check: if the circumcenter/off-center
+        # encroaches a segment, or is hidden from its bad triangle behind a
+        # constrained edge (walk-blocked, which also covers candidates outside
+        # the domain), split that segment instead of inserting the point.
         enc_seg = find_encroached(tcx, tcy)
+        if enc_seg < 0:
+            blk = walk_blocked(bad_idx, tcx, tcy)
+            if blk == -2:
+                dbg_fail += 1
+                continue
+            if blk >= 0:
+                if mesh.segments[blk].no_split:
+                    dbg_skip += 1
+                    continue
+                enc_seg = blk
         if enc_seg >= 0 and opts.no_steiner and mesh.segments[enc_seg].marker != 0:
             continue
         if enc_seg >= 0:
@@ -2310,6 +2478,10 @@ def refine_quality(mesh, opts, n_input_verts):
         new_pt = insert_point_lawson(mesh, np_pt, bad_idx, constrained_edges,
                                      affected, guard_dist2)
         if new_pt < 0:
+            # No -2 vertex-coincident fallback: with the walk-blocked
+            # encroachment check above and the CDT empty-circumcircle property,
+            # the circumcenter is at least one circumradius from every visible
+            # vertex; a refused insertion just tolerates the bad triangle.
             dbg_fail += 1
             continue
 
@@ -2982,9 +3154,13 @@ def main():
         t_prev[0] = now
         return ms
 
-    # 0. Optional PSLG cleanup
-    if opts.clean_pslg and opts.pslg:
-        clean_pslg(mesh, opts.clean_tol, opts.quiet)
+    # 0. PSLG hygiene always runs: exactly-duplicate vertices used to produce an
+    # empty mesh with no warning, and crossing segments hung CDT enforcement.
+    # Without -C the tolerance is essentially exact (bb_diag*1e-12), so legitimate
+    # near-coincident geometry is untouched; -C selects the coarser default
+    # (bb_diag*1e-6) or an explicit value.
+    if opts.pslg:
+        clean_pslg(mesh, opts.clean_tol if opts.clean_pslg else -2.0, opts.quiet)
         if not opts.quiet:
             print(f"  PSLG cleanup: {elapsed():.1f} ms", file=sys.stderr)
 
@@ -3038,6 +3214,19 @@ def main():
             build_delaunay(mesh)
             mesh.rebuild_adjacency()
             miss = enforce_constraints(mesh, opts.quiet)
+
+        if miss > 0:
+            # Hole/region flood fills treat segments as walls; a missing segment
+            # is a gap they would pour straight through, and a mesh without the
+            # segment misplaces boundary conditions and material interfaces for
+            # any downstream solver.  Fail hard rather than emit something subtly
+            # wrong.
+            sys.stderr.write(
+                f"Error: {miss} segment(s) could not be enforced after repeated\n"
+                "splitting (listed above as UNENFORCED). The mesh would be unusable,\n"
+                "so no output is written. Try -C (optionally with a larger\n"
+                "tolerance) or repair the input geometry near the listed segments.\n")
+            sys.exit(1)
 
     if not opts.quiet:
         print(f"  CDT: {elapsed():.1f} ms", file=sys.stderr)
