@@ -5,8 +5,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4
-// 02 Jun 2026
+// Version 0.4.2
+// 14 Jun 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -160,11 +160,18 @@ struct Triangle {
     double region_attrib;
     double region_max_area;
     int    marker;
+    // Bumped on every modification so stale refinement-queue entries can be
+    // skipped. NOTE: brace re-initialization on slot reuse RESETS this to 0,
+    // so a stale queue entry holding generation 0 can falsely match a reused
+    // slot (ABA). That is harmless BY DESIGN: the queue entry is only a hint,
+    // and the metric is recomputed from current vertices on every pop, so a
+    // false match just re-evaluates a live triangle. Do not "fix" the reset
+    // without making the pop path independent of entry identity.
     int    generation = 0;
 };
 
 // orient2d on raw coordinates — avoids constructing a Point with its
-// heap-allocated attribs vector.  Same exact-arithmetic fallback as orient2d.
+// heap-allocated attribs vector.  Same float256 fallback as orient2d.
 inline double orient2d_xy(double ax, double ay, double bx, double by, double cx, double cy){
     double Ax = bx - ax, Ay = by - ay;
     double Bx = cx - ax, By = cy - ay;
@@ -173,9 +180,16 @@ inline double orient2d_xy(double ax, double ay, double bx, double by, double cx,
     double M = std::max({std::abs(Ax), std::abs(Ay), std::abs(Bx), std::abs(By)});
     if(std::abs(det) > 6.662e-16 * M * M) return det;
 
-    float128 fAx = float128(bx) - float128(ax), fAy = float128(by) - float128(ay);
-    float128 fBx = float128(cx) - float128(ax), fBy = float128(cy) - float128(ay);
-    float128 fdet = fAx * fBy - fBx * fAy;
+    // Fall back to float256 (~245 bits): differences of doubles up to ~106
+    // bits and their products up to ~212 fit exactly, so the sign is exact
+    // for difference-exponent spans up to ~139 bits, with a deep-approximate
+    // floor of ~2^-240 relative. Exact zeros are exact (equal real products
+    // round identically). The narrower float128 was demonstrably not enough:
+    // with mixed-scale coordinates its product rounding loses truly nonzero
+    // determinants below ~2^-115 - see pred_test.cpp.
+    float256 fAx = float256(bx) - float256(ax), fAy = float256(by) - float256(ay);
+    float256 fBx = float256(cx) - float256(ax), fBy = float256(cy) - float256(ay);
+    float256 fdet = fAx * fBy - fBx * fAy;
     return fdet.hi;
 }
 
@@ -188,10 +202,28 @@ inline double orient2d(const Point& a, const Point& b, const Point& c){
     double M = std::max({std::abs(Ax), std::abs(Ay), std::abs(Bx), std::abs(By)});
     if(std::abs(det) > 6.662e-16 * M * M) return det;
 
-    // Fall back to exact float128 arithmetic (~117 bits, sufficient for orient2d)
-    float128 fAx = float128(b.x) - float128(a.x), fAy = float128(b.y) - float128(a.y);
-    float128 fBx = float128(c.x) - float128(a.x), fBy = float128(c.y) - float128(a.y);
-    float128 fdet = fAx * fBy - fBx * fAy;
+    // Fall back to float256 (~245 bits). NOT unconditionally exact, but
+    // honestly bounded: differences of doubles up to ~106 bits and their
+    // products up to ~212 fit exactly, so the sign is exact for
+    // difference-exponent spans up to ~139 bits; beyond that (and in any
+    // case below ~2^-240 relative) the result is deep-approximate -
+    // unreachable from 53-bit coordinates without deliberate construction.
+    // Exact zeros are exact (equal real products round identically), so
+    // collinear/coincident/on-segment decisions are correct. The narrower
+    // float128 (the original fallback) was demonstrably not enough: with
+    // mixed-scale coordinates - e.g. a vertex near the domain center after
+    // the precision shift - its product rounding loses truly nonzero
+    // determinants below ~2^-115 of the operand magnitude (pred_test.cpp
+    // plants such cases and float128 mis-answers half of them). The wider
+    // type costs ~87ns more per call but the double filter above leaves it
+    // <0.1% of calls (~1-3% total runtime on segment-heavy models, zero on
+    // typical ones). A double->float128->float256 cascade with per-stage
+    // honesty bounds was prototyped and measured to recover about half of
+    // that worst case; rejected as not worth the extra trust conditions.
+    // Unconditional exactness would need expansion arithmetic (Shewchuk).
+    float256 fAx = float256(b.x) - float256(a.x), fAy = float256(b.y) - float256(a.y);
+    float256 fBx = float256(c.x) - float256(a.x), fBy = float256(c.y) - float256(a.y);
+    float256 fdet = fAx * fBy - fBx * fAy;
     return fdet.hi;
 }
 
@@ -212,7 +244,13 @@ inline double inCircle(const Point& a, const Point& b, const Point& c, const Poi
                          std::abs(Cx), std::abs(Cy)});
     if(std::abs(det) > 1.333e-14 * M * M * M * M) return det;
 
-    // Fall back to exact float256 arithmetic (standard 3x3 formulation)
+    // Fall back to float256 (~245-bit) arithmetic (standard 3x3
+    // formulation). Same caveat as orient2d's fallback, one level deeper:
+    // squares of ~106-bit differences (~212 bits) fit exactly, but the
+    // final triple products exceed ~245 bits and round, so a truly nonzero
+    // determinant can be mis-signed only below ~2^-240 relative — beyond
+    // any input this side of deliberate construction. Exact zeros are
+    // exact.
     float256 fax = float256(a.x) - float256(d.x), fay = float256(a.y) - float256(d.y);
     float256 fbx = float256(b.x) - float256(d.x), fby = float256(b.y) - float256(d.y);
     float256 fcx = float256(c.x) - float256(d.x), fcy = float256(c.y) - float256(d.y);
@@ -228,15 +266,6 @@ double triArea(const Point& a, const Point& b, const Point& c){
     return 0.5*std::abs(orient2d(a,b,c));
 }
 
-// Angle at vertex a in triangle (a, b, c), in degrees
-double vertexAngle(const Point& a, const Point& b, const Point& c){
-    double abx=b.x-a.x, aby=b.y-a.y;
-    double acx=c.x-a.x, acy=c.y-a.y;
-    double dot=abx*acx+aby*acy;
-    double cross=abx*acy-aby*acx;
-    return std::atan2(std::abs(cross),dot)*180.0/M_PI;
-}
-
 double minAngle(const Point& a, const Point& b, const Point& c){
     double la = std::sqrt((b.x-c.x)*(b.x-c.x)+(b.y-c.y)*(b.y-c.y));
     double lb = std::sqrt((a.x-c.x)*(a.x-c.x)+(a.y-c.y)*(a.y-c.y));
@@ -246,27 +275,6 @@ double minAngle(const Point& a, const Point& b, const Point& c){
     double cosB = std::clamp((la*la+lc*lc-lb*lb)/(2*la*lc),-1.0,1.0);
     double cosC = std::clamp((la*la+lb*lb-lc*lc)/(2*la*lb),-1.0,1.0);
     return std::min({std::acos(cosA),std::acos(cosB),std::acos(cosC)})*180.0/M_PI;
-}
-
-void circumcenter(const Point& a, const Point& b, const Point& c,
-                  double& ccx, double& ccy){
-    double ax=b.x-a.x, ay=b.y-a.y;
-    double bx=c.x-a.x, by=c.y-a.y;
-    double D = 2.0*(ax*by - ay*bx);
-    if(std::abs(D)<EPS){ ccx=(a.x+b.x+c.x)/3.0; ccy=(a.y+b.y+c.y)/3.0; return; }
-    double ux = (by*(ax*ax+ay*ay) - ay*(bx*bx+by*by))/D;
-    double uy = (ax*(bx*bx+by*by) - bx*(ax*ax+ay*ay))/D;
-    ccx = a.x+ux; ccy = a.y+uy;
-}
-
-bool pointOnSegment(const Point& p, const Point& a, const Point& b){
-    if(orient2d(a,b,p)!=0) return false;
-    double dx=b.x-a.x, dy=b.y-a.y;
-    double t;
-    if(std::abs(dx)>EPS) t=(p.x-a.x)/dx;
-    else if(std::abs(dy)>EPS) t=(p.y-a.y)/dy;
-    else return false;
-    return t>=-EPS_SCALE && t<=1+EPS_SCALE;  // dimensionless: fixed tolerance
 }
 
 static inline std::pair<int,int> edgeKey(int a, int b){
@@ -420,6 +428,7 @@ void buildDelaunay(Mesh& mesh){
     // list (the fan around the new point is tiny) replacing an unordered_map.
     std::vector<int> bad, stk, slots, badEpoch;
     std::vector<std::pair<int,std::pair<int,int>>> pidxFan;
+    int skippedPts=0;
 
     for(int ii=0; ii<n; ii++){
         int pidx = order[ii];
@@ -449,7 +458,23 @@ void buildDelaunay(Mesh& mesh){
                 }
             }
         }
-        if(startTri<0) continue;
+        if(startTri<0){ skippedPts++; continue; }
+
+        // Precise re-walk with exact orientation tests (the Bowyer-Watson
+        // analogue of insertPointLawson's exact refinement): the EPS-tolerant
+        // walk above can stop at a triangle the point is actually just
+        // OUTSIDE of, and near a vertex the circumcircle of that triangle
+        // can exclude the point — yielding a falsely empty cavity below.
+        for(int refine=0; refine<(int)tris.size(); refine++){
+            const auto& t=tris[startTri];
+            int negEdge=-1;
+            for(int j=0;j<3;j++)
+                if(orient2d(pts[t.v[j]],pts[t.v[(j+1)%3]],p)<0.0){ negEdge=j; break; }
+            if(negEdge<0) break;             // exact containment (or on edge)
+            int nb=t.neighbors[negEdge];
+            if(nb<0) break;                  // hull edge — accept current
+            startTri=nb;
+        }
 
         // BFS cavity. badEpoch[t]==epoch marks t as a bad (to-be-deleted) triangle,
         // giving O(1) cavity membership for the boundary scan with no hashing.
@@ -473,8 +498,15 @@ void buildDelaunay(Mesh& mesh){
             }
         }
 
-        // Force-insert if cavity empty (near-coincident vertices)
-        if(bad.empty()){ bad.push_back(startTri); badEpoch[startTri]=epoch; }
+        // Empty cavity: with exact predicates, a point strictly inside any
+        // triangle is strictly inside its circumcircle, so an empty cavity
+        // means the point exactly coincides with an existing vertex (or the
+        // EPS-tolerant walk mislocated it). Leave it unconnected, like
+        // Triangle's duplicate-vertex handling. (A previous revision
+        // force-fanned the located triangle here, which emitted zero-area
+        // triangles for exact duplicates and overlapping triangles for
+        // mislocations — a corrupted triangulation either way.)
+        if(bad.empty()){ skippedPts++; continue; }
 
         // Collect boundary polygon (edges to triangles outside the cavity)
         struct BndEdge { int v0, v1, outerTri, outerLocalEdge; };
@@ -489,6 +521,20 @@ void buildDelaunay(Mesh& mesh){
                     poly.push_back({t.v[j], t.v[(j+1)%3], nb, oe});
                 }
             }
+        }
+
+        // Strict-CCW refusal (the Bowyer-Watson analogue of
+        // insertPointLawson's guard): every fan triangle must come out
+        // strictly positive, which exact predicates guarantee for a
+        // correctly located point. A violation means a duplicate or
+        // mislocated point slipped past the checks above — refuse the whole
+        // insertion BEFORE destroying any cavity triangle, leaving the mesh
+        // valid and the vertex unconnected.
+        {
+            bool fanOK=true;
+            for(auto& e:poly)
+                if(orient2d(pts[e.v0],pts[e.v1],p)<=0){ fanOK=false; break; }
+            if(!fanOK){ skippedPts++; continue; }
         }
 
         int nNew=(int)poly.size();
@@ -506,11 +552,10 @@ void buildDelaunay(Mesh& mesh){
 
         for(int i=0; i<nNew; i++){
             int s=slots[i];
+            // Strictly CCW by the fan guard above — no orientation fix-up.
             tris[s].v = {poly[i].v0, poly[i].v1, pidx};
             tris[s].neighbors = {-1,-1,-1};
             tris[s].region_attrib=0; tris[s].region_max_area=-1; tris[s].marker=0;
-            if(orient2d(pts[tris[s].v[0]],pts[tris[s].v[1]],pts[tris[s].v[2]])<0)
-                std::swap(tris[s].v[0], tris[s].v[1]);
         }
 
         // Wire outer adjacency
@@ -553,6 +598,9 @@ void buildDelaunay(Mesh& mesh){
         }
         lastTri = slots[0];
     }
+    if(skippedPts>0)
+        std::cerr<<"Warning: "<<skippedPts<<" point"<<(skippedPts==1?"":"s")
+                 <<" could not be inserted (duplicate or unlocatable); left unconnected.\n";
 
     // Remove dead triangles and super-triangle vertices
     std::vector<bool> keep(tris.size(), false);
@@ -714,49 +762,43 @@ int enforceConstraints(Mesh& mesh, bool quiet){
     auto earClip = [&](const std::vector<int>& poly) -> std::vector<std::array<int,3>> {
         std::vector<std::array<int,3>> result;
         std::vector<int> p = poly;
+        // Strict ear clipping: clip only well-formed, empty ears. If it stalls
+        // (a near-collinear vertex would have to be orphaned as a hanging node),
+        // it returns an INCOMPLETE result — the caller detects that by triangle
+        // count (a simple m-gon triangulates to exactly m-2 triangles) and
+        // declines the cavity, routing the segment to the split+rebuild fallback.
+        // No relaxed pass / fan fallback: those emitted degenerate triangles and
+        // hanging nodes on FEMM's near-collinear corner nodes.
         while(p.size()>3){
             bool clipped=false;
             int n=(int)p.size();
-            // Two passes: first strict, then relaxed tolerance for thin polygons
-            for(int pass2=0;pass2<2&&!clipped;pass2++){
-                double tol=(pass2==0)?0.0:-1e-8;
-                for(int i=0;i<n;i++){
-                    int prev=p[(i+n-1)%n], cur=p[i], next=p[(i+1)%n];
-                    if(orient2d(mesh.vertices[prev],mesh.vertices[cur],mesh.vertices[next])<=tol) continue;
-                    bool inside=false;
-                    for(int k=0;k<n&&!inside;k++){
-                        if(k==(i+n-1)%n||k==i||k==(i+1)%n) continue;
-                        int vi=p[k];
-                        // Use strict positive test: vertices on ear boundary are OK
-                        if(orient2d(mesh.vertices[prev],mesh.vertices[cur],mesh.vertices[vi])>0&&
-                           orient2d(mesh.vertices[cur],mesh.vertices[next],mesh.vertices[vi])>0&&
-                           orient2d(mesh.vertices[next],mesh.vertices[prev],mesh.vertices[vi])>0)
-                            inside=true;
-                    }
-                    if(inside) continue;
-                    result.push_back({prev,cur,next});
-                    p.erase(p.begin()+i);
-                    clipped=true;
-                    break;
+            for(int i=0;i<n;i++){
+                int prev=p[(i+n-1)%n], cur=p[i], next=p[(i+1)%n];
+                if(orient2d(mesh.vertices[prev],mesh.vertices[cur],mesh.vertices[next])<=0.0) continue; // strictly convex ears only
+                bool blocked=false;
+                for(int k=0;k<n&&!blocked;k++){
+                    if(k==(i+n-1)%n||k==i||k==(i+1)%n) continue;
+                    int vi=p[k];
+                    // reject if vi is strictly inside the ear OR lies on its new
+                    // diagonal (next-prev): clipping would orphan vi as a hanging node.
+                    if(orient2d(mesh.vertices[prev],mesh.vertices[cur],mesh.vertices[vi])>0&&
+                       orient2d(mesh.vertices[cur],mesh.vertices[next],mesh.vertices[vi])>0&&
+                       orient2d(mesh.vertices[next],mesh.vertices[prev],mesh.vertices[vi])>=0)
+                        blocked=true;
                 }
+                if(blocked) continue;
+                result.push_back({prev,cur,next});
+                p.erase(p.begin()+i);
+                clipped=true;
+                break;
             }
-            if(!clipped) break;
+            if(!clipped) break; // stalled: incomplete result, caller declines via count
         }
-        // Handle remaining polygon (3 or more vertices that couldn't be ear-clipped)
-        if(p.size()>=3){
-            if(p.size()==3){
-                double o=orient2d(mesh.vertices[p[0]],mesh.vertices[p[1]],mesh.vertices[p[2]]);
-                if(o>0) result.push_back({p[0],p[1],p[2]});
-                else if(o<0) result.push_back({p[0],p[2],p[1]});
-            } else {
-                // Fallback: fan triangulation from first vertex
-                for(int i=1;i<(int)p.size()-1;i++){
-                    double o=orient2d(mesh.vertices[p[0]],mesh.vertices[p[i]],mesh.vertices[p[i+1]]);
-                    if(o>0) result.push_back({p[0],p[i],p[i+1]});
-                    else if(o<0) result.push_back({p[0],p[i+1],p[i]});
-                    // Skip degenerate (collinear) triangles
-                }
-            }
+        if(p.size()==3){
+            double o=orient2d(mesh.vertices[p[0]],mesh.vertices[p[1]],mesh.vertices[p[2]]);
+            if(o>0) result.push_back({p[0],p[1],p[2]});
+            else if(o<0) result.push_back({p[0],p[2],p[1]});
+            // collinear triple: emit nothing -> incomplete -> caller declines
         }
         return result;
     };
@@ -1087,15 +1129,22 @@ int enforceConstraints(Mesh& mesh, bool quiet){
                             }
                             auto t1=earClip(poly1);
                             auto t2=earClip(poly2);
-                            newTris.insert(newTris.end(),t1.begin(),t1.end());
-                            newTris.insert(newTris.end(),t2.begin(),t2.end());
+                            // Accept only COMPLETE triangulations (an m-gon -> m-2 tris).
+                            // A short count means earClip declined a degenerate cavity;
+                            // leave newTris empty so the segment falls through to the
+                            // midpoint-split + rebuild fallback.
+                            if((int)t1.size()==std::max(0,(int)poly1.size()-2) &&
+                               (int)t2.size()==std::max(0,(int)poly2.size()-2)){
+                                newTris.insert(newTris.end(),t1.begin(),t1.end());
+                                newTris.insert(newTris.end(),t2.begin(),t2.end());
+                            }
                         } else {
-                            newTris=earClip(poly);
+                            auto tt=earClip(poly);
+                            if((int)tt.size()==std::max(0,(int)poly.size()-2)) newTris=tt;
                         }
                     }
 
                     if(!newTris.empty()){
-
                         // Assign slots
                         std::vector<int> crossedVec(crossedSet.begin(),crossedSet.end());
                         std::sort(crossedVec.begin(),crossedVec.end());
@@ -1368,6 +1417,22 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
         if(dx*dx+dy*dy < rejR2){ mesh.vertices.pop_back(); return -1; }
     }
 
+    // Output-orientation validation: every triangle a split creates must be
+    // strictly CCW (positive area). The locate walk uses the EXACT predicate to
+    // find the containing triangle, but it can accept a boundary triangle for a
+    // point that is actually OUTSIDE the domain (it breaks at a boundary edge with
+    // the point on the far side). Splitting there manufactures an inverted
+    // triangle — and one invalid triangle corrupts every circumcenter, Lawson
+    // flip, and adjacency built on top of it, so refinement can't converge.
+    // Refuse any split whose products aren't all positive-area; the bad triangle
+    // is tolerated instead. With the exact float256 predicate this is a hard
+    // guarantee: no inverted or degenerate triangle ever enters the mesh.
+    auto triCCW=[&](int a,int b,int c)->bool{
+        return orient2d_xy(mesh.vertices[a].x,mesh.vertices[a].y,
+                           mesh.vertices[b].x,mesh.vertices[b].y,
+                           mesh.vertices[c].x,mesh.vertices[c].y) > 0.0;
+    };
+
     // Inherit region from the containing triangle
     double reg_attr=t.region_attrib;
     double reg_area=t.region_max_area;
@@ -1379,6 +1444,8 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
     if(onEdge<0){
         // Interior: split triangle into 3
         int v0=t.v[0], v1=t.v[1], v2=t.v[2];
+        if(!triCCW(v0,v1,pidx) || !triCCW(v1,v2,pidx) || !triCCW(v2,v0,pidx)){
+            mesh.vertices.pop_back(); return -1; }   // point not strictly inside
         int n0=t.neighbors[0], n1=t.neighbors[1], n2=t.neighbors[2];
 
         int t0=ti;
@@ -1413,6 +1480,8 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
 
         if(n_ab<0){
             // Boundary edge: split 1 triangle into 2
+            if(!triCCW(va,pidx,vc) || !triCCW(pidx,vb,vc)){
+                mesh.vertices.pop_back(); return -1; }
             int t0=ti;
             int t1=(int)mesh.triangles.size();
             mesh.triangles.push_back(Triangle{{-1,-1,-1},{-1,-1,-1},0,-1,0});
@@ -1435,6 +1504,16 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
             if(je<0){ mesh.vertices.pop_back(); return -1; }
 
             int vd=tn.v[(je+2)%3];
+            // Coincidence check for the neighbor's apex: the on-edge split
+            // creates edges to vd, but the rejection loop above only tested
+            // the CONTAINING triangle's vertices. A point within the reject
+            // radius of vd passed that test, and the strict-CCW guard below
+            // accepts any sliver that is sub-EPS thin but still positively
+            // oriented — admitting a legal-but-degenerate triangle at vd.
+            {
+                double dx=mesh.vertices[vd].x-np.x, dy=mesh.vertices[vd].y-np.y;
+                if(dx*dx+dy*dy < rejR2){ mesh.vertices.pop_back(); return -1; }
+            }
             int n_avd, n_dvb;
             // Determine orientation of shared edge in tn
             if(tn.v[je]==vb && tn.v[(je+1)%3]==va){
@@ -1446,6 +1525,9 @@ int insertPointLawson(Mesh& mesh, const Point& np, int hintTri,
             }
 
 
+            if(!triCCW(va,pidx,vc) || !triCCW(pidx,vb,vc) ||
+               !triCCW(vb,pidx,vd) || !triCCW(pidx,va,vd)){
+                mesh.vertices.pop_back(); return -1; }
             // Inherit region from the neighbor triangle
             double reg_attr2=tn.region_attrib;
             double reg_area2=tn.region_max_area;
@@ -1623,9 +1705,12 @@ TriMetricResult triMetric(const Mesh& mesh, int ti, double minAng, double global
 
 void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     if(!opts.quality&&!opts.area_limit) return;
-    // Overshoot the target angle slightly to account for floating-point precision
-    // in off-center placement, ensuring we meet the user's requested angle.
-    double minAng=opts.quality?opts.min_angle+0.1:0.0;
+    // Refine to exactly the requested angle. (An earlier +0.1 deg overshoot
+    // "for floating-point precision" only added needless triangles: the
+    // refiner never stops at a triangle below the threshold it tests, so
+    // the output minimum can fall short of the target by at most rounding
+    // in the angle evaluation itself, orders of magnitude below 0.1 deg.)
+    double minAng=opts.quality?opts.min_angle:0.0;
     double cosMinAng=(minAng>0)?std::cos(minAng*M_PI/180.0):-1.0;
     double globalMaxA=opts.area_limit?opts.max_area:-1.0;
     bool useRegionArea=opts.area_limit;
@@ -1859,10 +1944,6 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
 
     EdgeSet constrainedEdges;
     for(auto& s:mesh.segments) constrainedEdges.insert(edgeKey(s.v0,s.v1));
-    // edgeToSeg is only consulted to find PBC partner segments; if the mesh
-    // has no periodic boundaries, skip maintaining it entirely.
-    bool anyPbc=false;
-    for(auto& s:mesh.segments) if(s.pbc_type>=0){ anyPbc=true; break; }
     double gxmin=1e30,gxmax=-1e30,gymin=1e30,gymax=-1e30;
     for(auto& v:mesh.vertices){
         gxmin=std::min(gxmin,v.x); gxmax=std::max(gxmax,v.x);
@@ -1948,12 +2029,12 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     };
     for(int si=0;si<(int)mesh.segments.size();si++) updateSegBounds(si);
 
-    // Map from edge key to segment index, for finding PBC partner segments.
-    // Only needed (and only populated) when periodic boundaries are present.
+    // Map from edge key to segment index: finds the subsegment behind a
+    // constrained triangle edge (for walk-blocked insertion) and PBC partner
+    // segments. Maintained across splits.
     std::unordered_map<std::pair<int,int>,int,PairHash> edgeToSeg;
-    if(anyPbc)
-        for(int si=0;si<(int)mesh.segments.size();si++)
-            edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
+    for(int si=0;si<(int)mesh.segments.size();si++)
+        edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
 
     // Core segment split helper (no PBC synchronization)
     auto splitSegmentCore=[&](int si, std::vector<int>& outAffected, int hintTri=-1) -> int {
@@ -1965,13 +2046,13 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
 
         auto ek=edgeKey(seg.v0,seg.v1);
         constrainedEdges.erase(ek);
-        if(anyPbc) edgeToSeg.erase(ek);
+        edgeToSeg.erase(ek);
         gridRemoveSeg(si);
 
         int midIdx=insertPointLawson(mesh,mid,hintTri,constrainedEdges,outAffected);
         if(midIdx<0){
             constrainedEdges.insert(ek);
-            if(anyPbc) edgeToSeg[ek]=si;
+            edgeToSeg[ek]=si;
             gridAddSeg(si);
             return -1;
         }
@@ -1992,10 +2073,8 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         mesh.segments.push_back(s2);
         constrainedEdges.insert(edgeKey(s1.v0,s1.v1));
         constrainedEdges.insert(edgeKey(s2.v0,s2.v1));
-        if(anyPbc){
-            edgeToSeg[edgeKey(s1.v0,s1.v1)]=si;
-            edgeToSeg[edgeKey(s2.v0,s2.v1)]=newSi;
-        }
+        edgeToSeg[edgeKey(s1.v0,s1.v1)]=si;
+        edgeToSeg[edgeKey(s2.v0,s2.v1)]=newSi;
         gridAddSeg(si);
         gridAddSeg(newSi);
         updateSegBounds(si);
@@ -2058,6 +2137,42 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             }
         }
         return -1;
+    };
+
+    // Visibility walk from a triangle toward a candidate insertion point.
+    // Returns the segment index of the first CONSTRAINED edge the straight
+    // walk must cross to reach the point, or -1 if the point is reachable
+    // (visible). A circumcenter/off-center hidden behind a subsegment
+    // (including one outside the domain entirely) encroaches that
+    // subsegment regardless of the diametral test -- without this, blocked
+    // candidates fail insertion and their bad triangles are silently
+    // dropped (e.g. a vertex a few microns off a constrained segment left
+    // a 0.107-degree sliver that refinement never touched). Returns -2 if
+    // the walk fails structurally (drop the candidate).
+    auto walkBlocked=[&](int startTri, double px, double py) -> int {
+        int ti=startTri;
+        for(int iter=0; iter<(int)mesh.triangles.size(); iter++){
+            if(ti<0||ti>=(int)mesh.triangles.size()) return -2;
+            auto& t=mesh.triangles[ti];
+            if(t.v[0]<0) return -2;
+            int exitEdge=-1;
+            for(int j=0;j<3;j++){
+                int va=t.v[j], vb=t.v[(j+1)%3];
+                double o=orient2d_xy(mesh.vertices[va].x,mesh.vertices[va].y,
+                                     mesh.vertices[vb].x,mesh.vertices[vb].y,
+                                     px,py);
+                if(o<0.0){ exitEdge=j; break; }
+            }
+            if(exitEdge<0) return -1; // point inside (or on boundary of) ti: visible
+            int va=t.v[exitEdge], vb=t.v[(exitEdge+1)%3];
+            if(constrainedEdges.count(edgeKey(va,vb))){
+                auto it=edgeToSeg.find(edgeKey(va,vb));
+                return (it!=edgeToSeg.end()) ? it->second : -2;
+            }
+            ti=t.neighbors[exitEdge];
+            if(ti<0) return -2; // unconstrained hull edge (shouldn't happen in a PSLG)
+        }
+        return -2;
     };
 
     // Detect acute apices: input vertices where two segments meet at < ~60°.
@@ -2127,10 +2242,19 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         PQItem it = buckets[curB].back(); buckets[curB].pop_back(); nQ--;
         return it;
     };
-    // Priority key fed into the queue: shortest-edge-first = -shortest_edge^2.
+    // Priority key fed into the queue: shortest-edge-first = -shortest_edge^2,
+    // the order under which off-center insertion guarantees growth (Ungor).
+    // (A scale-gated switch to worst-angle ordering for tiny triangles used
+    // to live here. It existed to deflect the queue away from degenerate
+    // features, where the absolute-EPS circumcenter test above silently
+    // degraded every insertion to a centroid and shortest-edge order dove
+    // into unbounded descent. With that test made scale-free the deflection
+    // is unnecessary -- and actively harmful: by breaking the smallest-first
+    // growth guarantee it stagnated refinement around sub-tiny features,
+    // carpeting their neighborhoods at -q33.)
     auto prioKey = [](const TriMetricResult& mr)->double{
         double minEdge2 = std::min(mr.la2, std::min(mr.lb2, mr.lc2));
-        return -minEdge2;
+        return -minEdge2;                  // shortest-edge
     };
     // Capped re-queue of a bad triangle whose circumcenter encroached a segment
     // but which was NOT itself modified by the split (so it isn't in segAff and
@@ -2141,7 +2265,7 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     // One retry recovers every fixable sliver across the test suite; allowing
     // more only adds a few redundant triangles with no quality gain (measured).
     // See quality_refinement_requeue_notes.md.
-    const int REQUEUE_CAP = 2;
+    const int REQUEUE_CAP = 4;
     // Too-close-insertion guard: reject an off-center/circumcenter that would
     // land within GUARD_FACTOR * (bad triangle's shortest edge) of an existing
     // vertex. Passed to insertPointLawson as a squared distance. Stops the
@@ -2161,7 +2285,10 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         if(badIdx >= (int)mesh.triangles.size()) continue;
         auto& bt = mesh.triangles[badIdx];
         if(bt.v[0]<0) continue;
-        // Fast staleness check: skip if triangle was modified since this PQ entry
+        // Fast staleness check: skip if triangle was modified since this PQ
+        // entry. Generation resets to 0 on slot reuse (see Triangle struct),
+        // so this can falsely accept a reused slot — harmless, because the
+        // metric below is recomputed from the triangle's current vertices.
         if(bt.generation != gen) continue;
         auto tmr = triMetric(mesh, badIdx, minAng, globalMaxA, useRegionArea, cosMinAng);
         if(tmr.metric <= 0) continue;
@@ -2196,18 +2323,16 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
                     dbgSkip++; continue;
                 }
             }
-            // For tiny triangles (all edges < bboxDiag * CLOSE_ENOUGH),
-            // accept a reduced minimum angle instead of the full threshold.
-            // These are in locally dense regions (e.g. near-coincident input
-            // vertices) where the full angle is unachievable.
-            {
-                double tinyLen2 = bbDiag * CLOSE_ENOUGH;
-                tinyLen2 *= tinyLen2;
-                if(la2 < tinyLen2 && lb2 < tinyLen2 && lc2 < tinyLen2){
-                    double ang=minAngle(a,b,c);
-                    if(ang >= std::min(minAng, TINY_TRI_ANGLE)){ dbgSkip++; continue; }
-                }
-            }
+            // (A tiny-triangle acceptance used to live here: all edges below
+            // bbDiag*CLOSE_ENOUGH => accept at TINY_TRI_ANGLE instead of the
+            // full threshold, on the theory that near-coincident input
+            // vertices make the full angle unachievable. Like the ordering
+            // switch above, it was guarding the absolute-EPS circumcenter
+            // bug; with that fixed, refinement resolves gaps all the way
+            // down to ~1e-9 relative at full quality, and the acceptance
+            // only ever lowered quality near such features. Gaps below the
+            // EPS floor are tolerated by the duplicate-rejection in
+            // insertPointLawson, which this rule never actually covered.)
         }
 
         // Compute circumcenter or off-center
@@ -2217,7 +2342,12 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             double xdo=b.x-a.x, ydo=b.y-a.y; // a->b
             double xao=c.x-a.x, yao=c.y-a.y; // a->c
             double D=2.0*(xdo*yao-ydo*xao);   // = 2*cross from triMetric
-            if(std::abs(D)<EPS){ tcx=(a.x+b.x+c.x)/3.0; tcy=(a.y+b.y+c.y)/3.0; }
+            // Scale-free degeneracy test: D scales like edge^2, so comparing
+            // against the absolute EPS classified every triangle smaller than
+            // ~sqrt(EPS) as degenerate and inserted its centroid instead --
+            // guaranteed insertion-radius descent near fine-scale features.
+            double Dmag=std::abs(xdo*yao)+std::abs(ydo*xao);
+            if(std::abs(D)<1e-12*Dmag || Dmag==0.0){ tcx=(a.x+b.x+c.x)/3.0; tcy=(a.y+b.y+c.y)/3.0; }
             else {
                 // dodist=xdo²+ydo²=lc2, aodist=xao²+yao²=lb2 (from triMetric)
                 double dodist=tmr.lc2, aodist=tmr.lb2;
@@ -2258,6 +2388,14 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
         // any segment, split that segment instead of inserting the point.
         // With -Y, skip if the encroached segment is a boundary segment (marker!=0).
         int encSeg=findEncroached(tcx,tcy);
+        if(encSeg<0){
+            int blk=walkBlocked(badIdx,tcx,tcy);
+            if(blk==-2){ dbgFail++; continue; }
+            if(blk>=0){
+                if(mesh.segments[blk].no_split){ dbgSkip++; continue; }
+                encSeg=blk;
+            }
+        }
         if(encSeg>=0 && opts.no_steiner && mesh.segments[encSeg].marker!=0){
             continue; // -Y: don't add Steiner points on boundary segments
         }
@@ -2601,33 +2739,78 @@ void extractEdges(Mesh& mesh){
 // File I/O
 // ============================================================
 
-static void skipLine(std::istream& in){
-    in.ignore(std::numeric_limits<std::streamsize>::max(),'\n');
-}
-static void skipComments(std::istream& in){
-    // Skip whitespace, then skip lines starting with '#'
-    in>>std::ws;
-    while(in.peek()=='#'){ skipLine(in); in>>std::ws; }
-}
+// Fast whole-file token scanner for the .node/.poly readers. The previous
+// iostream implementation cost ~290 ms on a 4.7 MB input: per-token locale
+// machinery, plus a std::string and std::istringstream constructed PER
+// LINE to probe the optional trailing LFS column. This cursor over a
+// single slurped buffer parses the same grammar at memory speed.
+// Semantics parity with the old code: nextInt/nextDouble skip plain
+// whitespace like operator>>, skipComments() additionally skips '#' lines,
+// and lineDouble() probes for one token on the CURRENT line then consumes
+// through the newline (replacing the getline + istringstream idiom).
+struct TokScan {
+    std::string buf;
+    const char* p=nullptr;
+    const char* end=nullptr;
+    bool load(const std::string& fn){
+        std::ifstream f(fn, std::ios::binary);
+        if(!f) return false;
+        f.seekg(0, std::ios::end);
+        std::streamsize sz=f.tellg();
+        f.seekg(0, std::ios::beg);
+        buf.resize((size_t)std::max<std::streamsize>(sz,0));
+        if(sz>0) f.read(&buf[0], sz);
+        p=buf.data(); end=p+buf.size();
+        return true;
+    }
+    void skipWs(){ while(p<end && (*p==' '||*p=='\t'||*p=='\r'||*p=='\n')) p++; }
+    void skipComments(){
+        skipWs();
+        while(p<end && *p=='#'){ while(p<end && *p!='\n') p++; skipWs(); }
+    }
+    bool nextInt(int& v){
+        skipWs(); if(p>=end) return false;
+        char* q=nullptr;
+        long t=std::strtol(p,&q,10);
+        if(q==p) return false;
+        v=(int)t; p=q; return true;
+    }
+    bool nextDouble(double& v){
+        skipWs(); if(p>=end) return false;
+        char* q=nullptr;
+        double t=std::strtod(p,&q);
+        if(q==p) return false;
+        v=t; p=q; return true;
+    }
+    void skipToEol(){ while(p<end && *p!='\n') p++; if(p<end) p++; }
+    // Optional trailing double on the current line; always consumes the line.
+    bool lineDouble(double& v){
+        while(p<end && (*p==' '||*p=='\t'||*p=='\r')) p++;
+        if(p<end && *p!='\n'){
+            char* q=nullptr;
+            double t=std::strtod(p,&q);
+            if(q!=p){ v=t; p=q; skipToEol(); return true; }
+        }
+        skipToEol(); return false;
+    }
+};
 
 bool readNodeFile(const std::string& filename, std::vector<Point>& pts, int& nAttribs, int& nMarkers){
-    std::ifstream f(filename);
-    if(!f){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
-    skipComments(f);
-    int n,dim; f>>n>>dim>>nAttribs>>nMarkers;
+    TokScan s;
+    if(!s.load(filename)){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
+    s.skipComments();
+    int n=0,dim=0; s.nextInt(n); s.nextInt(dim); s.nextInt(nAttribs); s.nextInt(nMarkers);
     pts.resize(n);
     for(int i=0;i<n;i++){
-        skipComments(f);
-        int idx; f>>idx>>pts[i].x>>pts[i].y;
+        s.skipComments();
+        int idx=0; s.nextInt(idx); s.nextDouble(pts[i].x); s.nextDouble(pts[i].y);
         pts[i].id=idx;
         pts[i].attribs.resize(nAttribs);
-        for(int a=0;a<nAttribs;a++) f>>pts[i].attribs[a];
-        if(nMarkers>0) f>>pts[i].marker; else pts[i].marker=0;
+        for(int a=0;a<nAttribs;a++) s.nextDouble(pts[i].attribs[a]);
+        if(nMarkers>0) s.nextInt(pts[i].marker); else pts[i].marker=0;
         // Optional LFS column after marker
-        std::string rest; std::getline(f,rest);
-        std::istringstream rss(rest);
         double lval;
-        if(rss>>lval) pts[i].lfs=lval;
+        if(s.lineDouble(lval)) pts[i].lfs=lval;
     }
     return true;
 }
@@ -2638,10 +2821,10 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
     auto& holes=mesh.holes;
     auto& regions=mesh.regions;
 
-    std::ifstream f(filename);
-    if(!f){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
-    skipComments(f);
-    int nv,dim,nmark; f>>nv>>dim>>nAttribs>>nmark;
+    TokScan s;
+    if(!s.load(filename)){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
+    s.skipComments();
+    int nv=0,dim=0,nmark=0; s.nextInt(nv); s.nextInt(dim); s.nextInt(nAttribs); s.nextInt(nmark);
     int firstVertIdx=std::numeric_limits<int>::max();
     if(nv==0){
         // Triangle convention: a .poly with 0 nodes references its companion
@@ -2659,89 +2842,82 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
     } else {
         pts.resize(nv);
         for(int i=0;i<nv;i++){
-            skipComments(f);
-            int idx; f>>idx>>pts[i].x>>pts[i].y;
+            s.skipComments();
+            int idx=0; s.nextInt(idx); s.nextDouble(pts[i].x); s.nextDouble(pts[i].y);
             pts[i].id=idx;
             firstVertIdx=std::min(firstVertIdx,idx);
             pts[i].attribs.resize(nAttribs);
-            for(int a=0;a<nAttribs;a++) f>>pts[i].attribs[a];
-            if(nmark>0) f>>pts[i].marker; else pts[i].marker=0;
+            for(int a=0;a<nAttribs;a++) s.nextDouble(pts[i].attribs[a]);
+            if(nmark>0) s.nextInt(pts[i].marker); else pts[i].marker=0;
             // Optional LFS column after marker
-            std::string rest; std::getline(f,rest);
-            std::istringstream rss(rest);
             double lval;
-            if(rss>>lval) pts[i].lfs=lval;
+            if(s.lineDouble(lval)) pts[i].lfs=lval;
         }
     }
     int base=(firstVertIdx==0)?0:1;
 
-    skipComments(f);
-    int ns,smark; f>>ns>>smark;
+    s.skipComments();
+    int ns=0,smark=0; s.nextInt(ns); s.nextInt(smark);
     segs.resize(ns);
     for(int i=0;i<ns;i++){
-        skipComments(f);
-        int idx; f>>idx>>segs[i].v0>>segs[i].v1;
+        s.skipComments();
+        int idx=0; s.nextInt(idx); s.nextInt(segs[i].v0); s.nextInt(segs[i].v1);
         segs[i].v0-=base; segs[i].v1-=base;
-        if(smark>0) f>>segs[i].marker; else segs[i].marker=0;
+        if(smark>0) s.nextInt(segs[i].marker); else segs[i].marker=0;
         // Optional LFS column after marker
-        std::string rest; std::getline(f,rest);
-        std::istringstream rss(rest);
         double lval;
-        if(rss>>lval) segs[i].lfs=lval;
+        if(s.lineDouble(lval)) segs[i].lfs=lval;
     }
-    skipComments(f);
-    int nh; f>>nh;
+    s.skipComments();
+    int nh=0; s.nextInt(nh);
     holes.resize(nh);
     for(int i=0;i<nh;i++){
-        skipComments(f);
-        int idx; f>>idx>>holes[i].x>>holes[i].y;
+        s.skipComments();
+        int idx=0; s.nextInt(idx); s.nextDouble(holes[i].x); s.nextDouble(holes[i].y);
     }
-    skipComments(f);
+    s.skipComments();
     {
         int nr=0;
-        if(f>>nr){
+        if(s.nextInt(nr)){
             regions.resize(nr);
             for(int i=0;i<nr;i++){
-                skipComments(f);
-                int idx; f>>idx>>regions[i].x>>regions[i].y>>regions[i].attrib;
+                s.skipComments();
+                int idx=0; s.nextInt(idx);
+                s.nextDouble(regions[i].x); s.nextDouble(regions[i].y);
+                s.nextDouble(regions[i].attrib);
                 regions[i].max_area=-1.0;
-                std::string rest; std::getline(f,rest);
-                std::istringstream rss(rest);
                 double aval;
-                if(rss>>aval) regions[i].max_area=aval;
+                if(s.lineDouble(aval)) regions[i].max_area=aval;
             }
         }
     }
-    // Clear stream state so optional extension sections can be attempted
-    f.clear();
 
     // ---- tangle extensions: arcs and PBCs (optional, after regions) ----
 
     // Arc segments
     {
-        skipComments(f);
+        s.skipComments();
         int nArcs=0, arcHasMarkers=0;
-        if(f>>nArcs>>arcHasMarkers){
+        if(s.nextInt(nArcs) && s.nextInt(arcHasMarkers)){
             for(int i=0;i<nArcs;i++){
-                skipComments(f);
-                int idx, v0, v1;
-                double angle, maxSegAngle;
-                f>>idx>>v0>>v1>>angle>>maxSegAngle;
+                s.skipComments();
+                int idx=0, v0=0, v1=0;
+                double angle=0, maxSegAngle=0;
+                s.nextInt(idx); s.nextInt(v0); s.nextInt(v1);
+                s.nextDouble(angle); s.nextDouble(maxSegAngle);
                 v0-=base; v1-=base;
                 int marker=0;
-                if(arcHasMarkers) f>>marker;
+                if(arcHasMarkers) s.nextInt(marker);
                 // Optional LFS after marker
                 double arcLfs=-1.0;
-                std::string rest; std::getline(f,rest);
-                std::istringstream rss(rest);
                 double lval;
-                if(rss>>lval) arcLfs=lval;
+                if(s.lineDouble(lval)) arcLfs=lval;
 
                 // Sanity checks
                 angle=std::abs(angle);
                 if(angle<1.0||angle>180.0){
                     std::cerr<<"Warning: arc "<<idx<<" angle "<<angle
-                             <<"° clamped to [1,180]\n";
+                             <<" deg clamped to [1,180]\n";
                     angle=std::max(1.0, std::min(180.0, angle));
                 }
                 if(maxSegAngle>10.0||maxSegAngle<=0.01) maxSegAngle=10.0;
@@ -2786,21 +2962,20 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
             }
         }
     }
-    f.clear();
 
     // PBC definitions: pair two boundary markers
     {
-        skipComments(f);
+        s.skipComments();
         int nPBCs=0;
-        if(f>>nPBCs){
+        if(s.nextInt(nPBCs)){
             for(int i=0;i<nPBCs;i++){
-                skipComments(f);
-                int idx, markerA, markerB, type;
-                f>>idx>>markerA>>markerB>>type;
+                s.skipComments();
+                int idx=0, markerA=0, markerB=0, type=0;
+                s.nextInt(idx); s.nextInt(markerA); s.nextInt(markerB); s.nextInt(type);
                 // Mark all segments with markerA or markerB as PBC
-                for(auto& s:segs){
-                    if(s.marker==markerA || s.marker==markerB){
-                        s.pbc_type=type;
+                for(auto& seg:segs){
+                    if(seg.marker==markerA || seg.marker==markerB){
+                        seg.pbc_type=type;
                     }
                 }
             }
@@ -2828,6 +3003,26 @@ static std::string stripKey(const std::string& line){
     auto eq=line.find('=');
     if(eq==std::string::npos) return "";
     return line.substr(eq+1);
+}
+
+// Parse up to maxN whitespace-separated numbers from a line (strtod
+// cursor). Replaces the per-record istringstream in the hot FEMM record
+// loops; like chained operator>>, parsing stops at the first non-numeric
+// token, and callers use the returned count to keep optional trailing
+// columns at their defaults.
+static int parseNums(const std::string& line, double* out, int maxN){
+    const char* p=line.c_str();
+    const char* end=p+line.size();
+    int n=0;
+    while(n<maxN){
+        while(p<end && (*p==' '||*p=='\t'||*p=='\r')) p++;
+        if(p>=end) break;
+        char* q=nullptr;
+        double v=std::strtod(p,&q);
+        if(q==p) break;
+        out[n++]=v; p=q;
+    }
+    return n;
 }
 
 bool readFemFile(const std::string& filename,
@@ -3023,16 +3218,19 @@ bool readFemFile(const std::string& filename,
             pts.resize(n);
             for(int i=0;i<n;i++){
                 if(!std::getline(f,line)) break;
-                std::istringstream ls(line);
+                double v[6]; int got=parseNums(line,v,6);
                 int bmark=0, group=0, conductor=0;
                 double ptLfs=-1.0;
-                ls>>pts[i].x>>pts[i].y>>bmark>>group;
+                if(got>0) pts[i].x=v[0];
+                if(got>1) pts[i].y=v[1];
+                if(got>2) bmark=(int)v[2];
+                if(got>3) group=(int)v[3];
                 if(hasConductors){
-                    ls>>conductor;  // 1-based conductor index
-                    ls>>ptLfs;      // optional 6th column: local feature size
+                    if(got>4) conductor=(int)v[4]; // 1-based conductor index
+                    if(got>5) ptLfs=v[5];          // optional 6th column: LFS
                 }
-                else
-                    ls>>ptLfs;      // local feature size (.fem only)
+                else if(got>4) ptLfs=v[4];         // local feature size (.fem only)
+                (void)group;                       // parsed for format completeness, unused
                 pts[i].id=i;
                 // Pack bc and conductor into marker:
                 // lower 16 bits = bc+2, upper 16 bits = conductor (1-based from file)
@@ -3051,11 +3249,18 @@ bool readFemFile(const std::string& filename,
             femSegs.resize(n);
             for(int i=0;i<n;i++){
                 if(!std::getline(f,line)) break;
-                std::istringstream ls(line);
+                double v[7]; int got=parseNums(line,v,7);
                 int bmark=0, hidden=0, group=0, conductor=0;
+                femSegs[i].n0=0; femSegs[i].n1=0;
                 femSegs[i].maxSideLength=0;
-                ls>>femSegs[i].n0>>femSegs[i].n1>>femSegs[i].maxSideLength>>bmark>>hidden>>group;
-                if(hasConductors) ls>>conductor;
+                if(got>0) femSegs[i].n0=(int)v[0];
+                if(got>1) femSegs[i].n1=(int)v[1];
+                if(got>2) femSegs[i].maxSideLength=v[2];
+                if(got>3) bmark=(int)v[3];
+                if(got>4) hidden=(int)v[4];
+                if(got>5) group=(int)v[5];
+                if(hasConductors && got>6) conductor=(int)v[6];
+                (void)hidden; (void)group;
                 if(bmark>0 || conductor>0)
                     femSegs[i].marker = -(int)((conductor<<16) | (bmark>0 ? bmark+1 : 0));
                 else
@@ -3071,13 +3276,18 @@ bool readFemFile(const std::string& filename,
             arcs.resize(n);
             for(int i=0;i<n;i++){
                 if(!std::getline(f,line)) break;
-                std::istringstream ls(line);
+                double v[9]; int got=parseNums(line,v,9);
                 int bmark=0, hidden=0, group=0, conductor=0;
-                double mySideLen=0;
-                ls>>arcs[i].n0>>arcs[i].n1>>arcs[i].arcLength>>arcs[i].maxSideLength
-                  >>bmark>>hidden>>group;
-                if(hasConductors) ls>>conductor;
-                ls>>mySideLen;
+                arcs[i].n0=0; arcs[i].n1=0; arcs[i].arcLength=0; arcs[i].maxSideLength=0;
+                if(got>0) arcs[i].n0=(int)v[0];
+                if(got>1) arcs[i].n1=(int)v[1];
+                if(got>2) arcs[i].arcLength=v[2];
+                if(got>3) arcs[i].maxSideLength=v[3];
+                if(got>4) bmark=(int)v[4];
+                if(got>5) hidden=(int)v[5];
+                if(got>6) group=(int)v[6];
+                if(hasConductors && got>7) conductor=(int)v[7];
+                (void)hidden; (void)group;
                 if(bmark>0 || conductor>0)
                     arcs[i].marker = -(int)((conductor<<16) | (bmark>0 ? bmark+1 : 0));
                 else
@@ -3092,9 +3302,10 @@ bool readFemFile(const std::string& filename,
             int n; ss>>n;
             for(int i=0;i<n;i++){
                 if(!std::getline(f,line)) break;
-                std::istringstream ls(line);
-                Hole h;
-                ls>>h.x>>h.y;
+                double v[2]; int got=parseNums(line,v,2);
+                Hole h{0,0};
+                if(got>0) h.x=v[0];
+                if(got>1) h.y=v[1];
                 holes.push_back(h);
             }
             continue;
@@ -3110,10 +3321,19 @@ bool readFemFile(const std::string& filename,
             int k=0; // counter for non-<No Mesh> blocks
             for(int i=0;i<n;i++){
                 if(!std::getline(f,line)) break;
-                std::istringstream ls(line);
-                double x,y,diam=-1,magDir=0;
+                double v[9]; int got=parseNums(line,v,9);
+                double x=0,y=0,diam=-1,magDir=0;
                 int blockType=0,circIdx=0,group=0,turns=1,isExt=0;
-                ls>>x>>y>>blockType>>diam>>circIdx>>magDir>>group>>turns>>isExt;
+                if(got>0) x=v[0];
+                if(got>1) y=v[1];
+                if(got>2) blockType=(int)v[2];
+                if(got>3) diam=v[3];
+                if(got>4) circIdx=(int)v[4];
+                if(got>5) magDir=v[5];
+                if(got>6) group=(int)v[6];
+                if(got>7) turns=(int)v[7];
+                if(got>8) isExt=(int)v[8];
+                (void)circIdx; (void)magDir; (void)turns; (void)group;
                 if(blockType==0){
                     // <No Mesh> block → add as hole seed point
                     holes.push_back({x,y});
@@ -3805,14 +4025,20 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
     auto& segs = mesh.segments;
     int nv = (int)pts.size();
 
-    // Compute auto tolerance if not specified
+    // Compute auto tolerance if not specified. tol == -1 is the -C default
+    // (bbDiag * CLOSE_ENOUGH); tol <= -2 is the always-on hygiene pass run
+    // for every PSLG, with an essentially-exact tolerance (bbDiag * 1e-12,
+    // ~4 decimal digits above double ULP) that merges only true duplicates
+    // and geometry no refinement could ever resolve, while still splitting
+    // crossing segments (the intersection test is tolerance-independent).
     if(tol < 0){
         double minX=pts[0].x, maxX=pts[0].x, minY=pts[0].y, maxY=pts[0].y;
         for(auto& p : pts){
             minX=std::min(minX,p.x); maxX=std::max(maxX,p.x);
             minY=std::min(minY,p.y); maxY=std::max(maxY,p.y);
         }
-        tol = std::sqrt((maxX-minX)*(maxX-minX)+(maxY-minY)*(maxY-minY)) * CLOSE_ENOUGH;
+        double bbDiag=std::sqrt((maxX-minX)*(maxX-minX)+(maxY-minY)*(maxY-minY));
+        tol = bbDiag * ((tol<=-2.0) ? 1e-12 : CLOSE_ENOUGH);
     }
     double tol2 = tol * tol;
 
@@ -3890,6 +4116,39 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
         gcell=std::max({(xmx-xmn)/side,(ymx-ymn)/side,1e-30});
         gnx=(int)((xmx-xmn)/gcell)+1; gny=(int)((ymx-ymn)/gcell)+1;
         cellEpoch.assign((size_t)gnx*gny, 0); cellEpochCtr=0;
+    };
+    // Exact grid traversal of the segment (Amanatides-Woo DDA), no halo:
+    // used by section 5, where only cell SHARING matters (two properly
+    // crossing segments both traverse the cell containing the crossing).
+    // The 3x3-haloed sampling below inflates per-cell occupancy ~9x, which
+    // squares into the pair-enumeration cost. When a step lands exactly on
+    // a cell corner, both adjacent cells are included so two paths crossing
+    // at that corner still share one.
+    auto segCellsExact=[&](double x0,double y0,double x1,double y1,std::vector<int>& cells){
+        cells.clear();
+        int cx=std::clamp((int)((x0-gx0)/gcell),0,gnx-1);
+        int cy=std::clamp((int)((y0-gy0)/gcell),0,gny-1);
+        int ex=std::clamp((int)((x1-gx0)/gcell),0,gnx-1);
+        int ey=std::clamp((int)((y1-gy0)/gcell),0,gny-1);
+        cells.push_back(cx*gny+cy);
+        double dx=x1-x0, dy=y1-y0;
+        int sx=(dx>0)-(dx<0), sy=(dy>0)-(dy<0);
+        double tMaxX=(sx!=0)?(((cx+(sx>0?1:0))*gcell+gx0)-x0)/dx:1e30;
+        double tMaxY=(sy!=0)?(((cy+(sy>0?1:0))*gcell+gy0)-y0)/dy:1e30;
+        double tDx=(sx!=0)?gcell/std::abs(dx):1e30;
+        double tDy=(sy!=0)?gcell/std::abs(dy):1e30;
+        int guard=2*(gnx+gny)+8;
+        while((cx!=ex||cy!=ey) && guard-->0){
+            if(std::abs(tMaxX-tMaxY)<1e-12){
+                // corner crossing: include both side cells
+                if(cx+sx>=0&&cx+sx<gnx) cells.push_back((cx+sx)*gny+cy);
+                if(cy+sy>=0&&cy+sy<gny) cells.push_back(cx*gny+(cy+sy));
+                cx+=sx; cy+=sy; tMaxX+=tDx; tMaxY+=tDy;
+            } else if(tMaxX<tMaxY){ cx+=sx; tMaxX+=tDx; }
+            else { cy+=sy; tMaxY+=tDy; }
+            if(cx<0||cx>=gnx||cy<0||cy>=gny) break;
+            cells.push_back(cx*gny+cy);
+        }
     };
     // Cells the segment's line passes through, each haloed 3x3. Deduped with an
     // epoch stamp (no per-segment sort) since this is called once per segment.
@@ -3979,68 +4238,82 @@ void cleanPSLG(Mesh& mesh, double tol, bool quiet){
             rebuildGridDims();
             std::vector<std::vector<int>> sgrid(gnx*gny);
             for(int s=0;s<(int)segs.size();s++){
-                segCells(pts[segs[s].v0].x,pts[segs[s].v0].y,
-                         pts[segs[s].v1].x,pts[segs[s].v1].y,cells);
+                segCellsExact(pts[segs[s].v0].x,pts[segs[s].v0].y,
+                              pts[segs[s].v1].x,pts[segs[s].v1].y,cells);
                 for(int c:cells) sgrid[c].push_back(s);
             }
-            for(int i=0; i<(int)segs.size() && !changed; i++){
-                double ax=pts[segs[i].v0].x, ay=pts[segs[i].v0].y;
-                double bx=pts[segs[i].v1].x, by=pts[segs[i].v1].y;
-                double ax0=std::min(ax,bx), ax1=std::max(ax,bx);
-                double ay0=std::min(ay,by), ay1=std::max(ay,by);
-                // Lowest j>i whose segment intersects i, gathered from the grid
-                // cells i crosses (an intersecting partner shares the crossing
-                // cell). Tracked directly so candidate dupes need no sort/unique.
-                segCells(ax,ay,bx,by,cells);
-                double d1x=bx-ax, d1y=by-ay;
-                int bestJ=-1; double ixBest=0, iyBest=0;
-                for(int c:cells) for(int j:sgrid[c]){
-                    if(j<=i) continue; // pairs with lower index handled as their own i
-                    if(bestJ>=0 && j>=bestJ) continue; // can't beat current best
-                    // Skip if they share an endpoint
-                    if(segs[i].v0==segs[j].v0 || segs[i].v0==segs[j].v1 ||
-                       segs[i].v1==segs[j].v0 || segs[i].v1==segs[j].v1) continue;
-                    // Bounding box pre-filter
-                    double bx0=std::min(pts[segs[j].v0].x,pts[segs[j].v1].x);
-                    double bx1=std::max(pts[segs[j].v0].x,pts[segs[j].v1].x);
-                    if(ax1<bx0 || ax0>bx1) continue;
-                    double by0=std::min(pts[segs[j].v0].y,pts[segs[j].v1].y);
-                    double by1=std::max(pts[segs[j].v0].y,pts[segs[j].v1].y);
-                    if(ay1<by0 || ay0>by1) continue;
-                    double cx=pts[segs[j].v0].x, cy=pts[segs[j].v0].y;
-                    double dx2=pts[segs[j].v1].x, dy2=pts[segs[j].v1].y;
-                    // Compute intersection
-                    double d2x=dx2-cx, d2y=dy2-cy;
-                    double denom=d1x*d2y-d1y*d2x;
-                    if(std::abs(denom) < 1e-15) continue;
-                    double t=((cx-ax)*d2y-(cy-ay)*d2x)/denom;
-                    double u=((cx-ax)*d1y-(cy-ay)*d1x)/denom;
-                    if(t<=0 || t>=1 || u<=0 || u>=1) continue;
-                    // Intersection at (ax+t*d1x, ay+t*d1y)
-                    bestJ=j; ixBest=ax+t*d1x; iyBest=ay+t*d1y;
-                }
-                if(bestJ>=0){
-                    int j=bestJ; double ix=ixBest, iy=iyBest;
-                    // Check if intersection is near an existing node
-                    int nearNode=-1;
-                    for(int k=0;k<(int)pts.size();k++){
-                        double ex=pts[k].x-ix, ey=pts[k].y-iy;
-                        if(ex*ex+ey*ey < tol2){ nearNode=k; break; }
+            // Enumerate candidate pairs CELL by CELL: the previous scan
+            // re-walked every segment's cell path a second time, doubling
+            // the dominant cost on segment-heavy inputs. Cell lists are in
+            // ascending segment order (built that way above), and the scan
+            // tracks the lexicographically smallest intersecting pair —
+            // exactly the pair the old lowest-i-then-lowest-j scan acted
+            // on, so the output is unchanged.
+            int bestI=-1, bestJ=-1; double ixBest=0, iyBest=0;
+            for(int c=0;c<gnx*gny;c++){
+                auto& cell=sgrid[c];
+                for(size_t a=0;a+1<cell.size();a++){
+                    int i=cell[a];
+                    if(bestI>=0 && i>bestI) break; // ascending: no better pair here
+                    double ax=pts[segs[i].v0].x, ay=pts[segs[i].v0].y;
+                    double bx=pts[segs[i].v1].x, by=pts[segs[i].v1].y;
+                    double ax0=std::min(ax,bx), ax1=std::max(ax,bx);
+                    double ay0=std::min(ay,by), ay1=std::max(ay,by);
+                    double d1x=bx-ax, d1y=by-ay;
+                    for(size_t b=a+1;b<cell.size();b++){
+                        int j=cell[b];
+                        if(bestI>=0 && i==bestI && j>=bestJ) break; // ascending
+                        // Skip if they share an endpoint
+                        if(segs[i].v0==segs[j].v0 || segs[i].v0==segs[j].v1 ||
+                           segs[i].v1==segs[j].v0 || segs[i].v1==segs[j].v1) continue;
+                        // Bounding box pre-filter
+                        double bx0=std::min(pts[segs[j].v0].x,pts[segs[j].v1].x);
+                        double bx1=std::max(pts[segs[j].v0].x,pts[segs[j].v1].x);
+                        if(ax1<bx0 || ax0>bx1) continue;
+                        double by0=std::min(pts[segs[j].v0].y,pts[segs[j].v1].y);
+                        double by1=std::max(pts[segs[j].v0].y,pts[segs[j].v1].y);
+                        if(ay1<by0 || ay0>by1) continue;
+                        double cx=pts[segs[j].v0].x, cy=pts[segs[j].v0].y;
+                        double dx2=pts[segs[j].v1].x, dy2=pts[segs[j].v1].y;
+                        // Compute intersection
+                        double d2x=dx2-cx, d2y=dy2-cy;
+                        double denom=d1x*d2y-d1y*d2x;
+                        // Parallel-rejection must be SCALE-FREE: denom scales
+                        // with the product of the segment lengths, so a fixed
+                        // 1e-15 cutoff silently skipped genuine crossings
+                        // between short near-parallel segments (and was
+                        // needlessly far from underflow for long ones).
+                        double dmag=std::abs(d1x*d2y)+std::abs(d1y*d2x);
+                        if(dmag==0.0 || std::abs(denom) < 1e-12*dmag) continue;
+                        double t=((cx-ax)*d2y-(cy-ay)*d2x)/denom;
+                        double u=((cx-ax)*d1y-(cy-ay)*d1x)/denom;
+                        if(t<=0 || t>=1 || u<=0 || u>=1) continue;
+                        // Intersection at (ax+t*d1x, ay+t*d1y)
+                        bestI=i; bestJ=j; ixBest=ax+t*d1x; iyBest=ay+t*d1y;
                     }
-                    if(nearNode<0){
-                        nearNode=(int)pts.size();
-                        pts.push_back({ix,iy,nearNode,0,{}});
-                    }
-                    // Split both segments at the intersection
-                    Segment si2=segs[i]; si2.v0=nearNode;
-                    segs[i].v1=nearNode;
-                    segs.push_back(si2);
-                    Segment sj2=segs[j]; sj2.v0=nearNode;
-                    segs[j].v1=nearNode;
-                    segs.push_back(sj2);
-                    splitSegs+=2;
-                    changed=true;
                 }
+            }
+            if(bestI>=0){
+                int i=bestI, j=bestJ; double ix=ixBest, iy=iyBest;
+                // Check if intersection is near an existing node
+                int nearNode=-1;
+                for(int k=0;k<(int)pts.size();k++){
+                    double ex=pts[k].x-ix, ey=pts[k].y-iy;
+                    if(ex*ex+ey*ey < tol2){ nearNode=k; break; }
+                }
+                if(nearNode<0){
+                    nearNode=(int)pts.size();
+                    pts.push_back({ix,iy,nearNode,0,{}});
+                }
+                // Split both segments at the intersection
+                Segment si2=segs[i]; si2.v0=nearNode;
+                segs[i].v1=nearNode;
+                segs.push_back(si2);
+                Segment sj2=segs[j]; sj2.v0=nearNode;
+                segs[j].v1=nearNode;
+                segs.push_back(sj2);
+                splitSegs+=2;
+                changed=true;
             }
         }
     }
@@ -4106,9 +4379,13 @@ void printUsage(){
 // Shared meshing pipeline: cleanPSLG → Delaunay → CDT → holes →
 // PBC → regions → quality → cleanup → jettison
 // Used by both main() and tangle_mesh_fem().
+// Returns false on a fatal input condition (segments that could not be
+// enforced): a mesh with missing segments would carry boundaries and
+// material interfaces in the wrong place, silently corrupting any
+// downstream solve, so callers must produce no output at all.
 // ============================================================
 
-static void runMeshPipeline(Mesh& mesh, const Options& opts)
+static bool runMeshPipeline(Mesh& mesh, const Options& opts)
 {
     // Shift coordinates to near the origin to maximize floating-point precision.
     double shiftX=0, shiftY=0;
@@ -4122,8 +4399,13 @@ static void runMeshPipeline(Mesh& mesh, const Options& opts)
     }
 
     // 0. Optional PSLG cleanup
-    if(opts.clean_pslg && opts.pslg)
-        cleanPSLG(mesh, opts.clean_tol, opts.quiet);
+    // PSLG hygiene always runs: exactly-duplicate vertices used to produce
+    // an empty mesh with no warning, and crossing segments hung CDT
+    // enforcement. Without -C the tolerance is essentially exact
+    // (bbDiag*1e-12), so legitimate near-coincident geometry is untouched;
+    // -C selects the coarser default (bbDiag*1e-6) or an explicit value.
+    if(opts.pslg)
+        cleanPSLG(mesh, opts.clean_pslg ? opts.clean_tol : -2.0, opts.quiet);
 
     // 1. Delaunay triangulation
     buildDelaunay(mesh);
@@ -4148,27 +4430,68 @@ static void runMeshPipeline(Mesh& mesh, const Options& opts)
             }
             if(toSplit.empty()) break;
 
+            // Insert the split midpoints into the EXISTING triangulation via
+            // Lawson insertion instead of rebuilding from scratch: a full
+            // Bowyer-Watson rebuild is O(mesh) per round, and an input whose
+            // unenforceable stub sits in a fog of near-coincident vertices
+            // can take several rounds (observed: 4 rounds = half the total
+            // runtime on such a file). Already-present segment edges are
+            // protected from the insertion's flips. If an insertion is
+            // refused (midpoint within EPS of an existing vertex), fall back
+            // to the full rebuild for this round.
+            EdgeSet segEdges;
+            for(auto& s:mesh.segments) segEdges.insert(edgeKey(s.v0,s.v1));
+            bool fullRebuild=false;
+            std::vector<int> insAffected;
             for(int ii=(int)toSplit.size()-1; ii>=0; ii--){
                 int si=toSplit[ii];
-                auto& seg=mesh.segments[si];
+                auto seg=mesh.segments[si]; // copy
                 double mx=(mesh.vertices[seg.v0].x+mesh.vertices[seg.v1].x)/2;
                 double my=(mesh.vertices[seg.v0].y+mesh.vertices[seg.v1].y)/2;
                 int bm=std::max(mesh.vertices[seg.v0].marker,
                                 mesh.vertices[seg.v1].marker);
-                int midIdx=(int)mesh.vertices.size();
-                mesh.vertices.push_back({mx,my,midIdx,bm,{}});
+                int midIdx=-1;
+                if(!fullRebuild){
+                    Point mid{mx,my,(int)mesh.vertices.size(),bm,{}};
+                    insAffected.clear();
+                    midIdx=insertPointLawson(mesh,mid,-1,segEdges,insAffected);
+                }
+                if(midIdx<0){
+                    fullRebuild=true;
+                    midIdx=(int)mesh.vertices.size();
+                    mesh.vertices.push_back({mx,my,midIdx,bm,{}});
+                }
                 int v0=seg.v0, v1=seg.v1, mk=seg.marker;
                 double slfs=seg.lfs; int spt=seg.pbc_type;
                 mesh.segments[si]={v0,midIdx,mk,slfs,spt};
                 mesh.segments.insert(mesh.segments.begin()+si+1,{midIdx,v1,mk,slfs,spt});
+                segEdges.erase(edgeKey(v0,v1));
+                segEdges.insert(edgeKey(v0,midIdx));
+                segEdges.insert(edgeKey(midIdx,v1));
             }
             if(!opts.quiet)
-                std::cerr<<"  Split "<<(int)toSplit.size()<<" unenforced segments, rebuilding...\n";
+                std::cerr<<"  Split "<<(int)toSplit.size()<<" unenforced segments, "
+                         <<(fullRebuild?"rebuilding...":"re-enforcing...")<<"\n";
 
-            mesh.triangles.clear();
-            buildDelaunay(mesh);
-            mesh.rebuildAdjacency();
+            if(fullRebuild){
+                mesh.triangles.clear();
+                buildDelaunay(mesh);
+                mesh.rebuildAdjacency();
+            }
             miss = enforceConstraints(mesh, opts.quiet);
+        }
+        if(miss>0){
+            // Hole/region flood fills treat segments as walls; a missing
+            // segment is a gap they would pour straight through, and a
+            // mesh without the segment misplaces boundary conditions and
+            // material interfaces for any downstream solver. Fail hard
+            // rather than emit something subtly wrong.
+            std::cerr<<"Error: "<<miss<<" segment(s) could not be enforced after "
+                       "repeated splitting (listed above as UNENFORCED).\n"
+                       "The mesh would be unusable, so no output is written. Try -C\n"
+                       "(optionally with a larger tolerance) or repair the input\n"
+                       "geometry near the listed segments.\n";
+            return false;
         }
     }
 
@@ -4368,6 +4691,7 @@ static void runMeshPipeline(Mesh& mesh, const Options& opts)
 
     if(!opts.quiet)
         std::cerr<<"Output: "<<mesh.vertices.size()<<" vertices, "<<mesh.triangles.size()<<" triangles\n";
+    return true;
 }
 
 #ifndef TANGLE_AS_LIBRARY
@@ -4458,7 +4782,7 @@ int main(int argc, char* argv[]){
         return 0;
     }
 
-    runMeshPipeline(mesh, opts);
+    if(!runMeshPipeline(mesh, opts)) return 1;
 
     std::string outBase=base+(opts.suppress_iter?"":".1");
     writeNodeFile(outBase+".node",mesh.vertices,nAttribs,nMarkers>0||opts.pslg,opts);
@@ -4552,7 +4876,7 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
         std::cerr<<"\n";
     }
 
-    runMeshPipeline(mesh, opts);
+    if(!runMeshPipeline(mesh, opts)) return 1;
 
     outMesh = std::move(mesh);
     return 0;
