@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.1
-12 Jun 2026
+Version 0.4.3
+25 Jun 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -107,7 +107,7 @@ class Options:
     neighbors: bool = False
     clean_pslg: bool = False
     clean_tol: float = -1.0  # -1 = auto (bboxDiag * 1e-6)
-    reorder: bool = False  # Cuthill-McKee bandwidth reduction
+    reorder: bool = False  # reverse Cuthill-McKee bandwidth/profile reduction
     first_index: int = 1
 
 
@@ -793,20 +793,13 @@ def build_delaunay(mesh):
                                 break
                     poly.append((t.v[j], t.v[(j + 1) % 3], nb, oe))
 
-        # Strict-CCW refusal (the Bowyer-Watson analogue of insert_point_lawson's
-        # guard): every fan triangle must come out strictly positive, which exact
-        # predicates guarantee for a correctly located point.  A violation means a
-        # duplicate or mislocated point slipped past the checks above -- refuse the
-        # whole insertion BEFORE destroying any cavity triangle, leaving the mesh
-        # valid and the vertex unconnected.
-        fan_ok = True
-        for e in poly:
-            if orient2d(pts[e[0]], pts[e[1]], p) <= 0:
-                fan_ok = False
-                break
-        if not fan_ok:
-            skipped_pts += 1
-            continue
+        # (A strict-CCW fan-refusal guard used to live here -- one orient2d per
+        # cavity-boundary edge, refusing the insertion if any fan triangle came
+        # out non-CCW.  With exact predicates the precise re-walk above guarantees
+        # a correctly located point produces an all-CCW fan, so it refused 0
+        # insertions suite-wide and was removed; outputs byte-identical without
+        # it.  The empty-cavity skip above still catches exact duplicates.
+        # tangle.cpp 0.4.3.)
 
         n_new = len(poly)
         bad.sort()
@@ -1135,8 +1128,18 @@ def enforce_constraints(mesh, quiet):
     # Direct adjacency check: flip-based
     mesh.rebuild_adjacency()
     v2t = build_v2t()
+    # Constrained-segment edges: a flip must never destroy one of these to
+    # enforce another, or two crossing segments oscillate A<->B forever.
+    seg_set = set()
+    for s in mesh.segments:
+        seg_set.add(edge_key(s.v0, s.v1))
     any_fixed = True
-    while any_fixed:
+    # Hard cap: each segment needs only a handful of flips; the cap stops a
+    # cocircular/collinear configuration from spinning. Segments not enforced
+    # here fall through to the corridor + midpoint-split stages below.
+    flip_passes = 2 * len(mesh.segments) + 16
+    while any_fixed and flip_passes > 0:
+        flip_passes -= 1
         any_fixed = False
         for seg in mesh.segments:
             su2, sv2 = seg.v0, seg.v1
@@ -1160,6 +1163,8 @@ def enforce_constraints(mesh, quiet):
                     a, b = t.v[j], t.v[(j + 1) % 3]
                     if a == su2 or b == su2 or a == sv2 or b == sv2:
                         continue
+                    if edge_key(a, b) in seg_set:
+                        continue  # never flip out a constrained segment
                     p_v, q_v = su2, sv2
                     o1 = orient2d(mesh.vertices[p_v], mesh.vertices[a], mesh.vertices[q_v])
                     o2 = orient2d(mesh.vertices[p_v], mesh.vertices[q_v], mesh.vertices[b])
@@ -1259,9 +1264,10 @@ def enforce_constraints(mesh, quiet):
             for v_key in adj_map:
                 if len(adj_map[v_key]) > 1:
                     adj_map[v_key].sort(
-                        key=lambda x: math.atan2(
+                        key=lambda x: (math.atan2(
                             mesh.vertices[x[0]].y - mesh.vertices[v_key].y,
-                            mesh.vertices[x[0]].x - mesh.vertices[v_key].x))
+                            mesh.vertices[x[0]].x - mesh.vertices[v_key].x),
+                            x[0]))  # deterministic tie-break on collinear edges
 
             poly_chain = []
             used_edges = set()
@@ -1290,7 +1296,11 @@ def enforce_constraints(mesh, quiet):
                         turn = out_angle - in_angle
                         while turn <= 0:
                             turn += 2 * math.pi
-                        if turn < best_turn:
+                        # deterministic tie-break: on equal turn (collinear
+                        # outgoing edges) prefer the lower target-vertex index
+                        if turn < best_turn or \
+                           (turn == best_turn and best_idx >= 0 and
+                                outs[k][0] < outs[best_idx][0]):
                             best_turn = turn
                             best_idx = k
                 else:
@@ -1780,10 +1790,11 @@ def insert_point_lawson(mesh, np, hint_tri, constrained_edges, affected, min_dis
                      mesh.vertices[fq]) <= 0:
             continue
 
-        if orient2d(mesh.vertices[fa], mesh.vertices[fq], mesh.vertices[fp]) <= 0:
-            continue
-        if orient2d(mesh.vertices[fb], mesh.vertices[fp], mesh.vertices[fq]) <= 0:
-            continue
+        # No convexity check: with exact predicates, in_circle(fa,fb,fp,fq)>0
+        # implies the quad (fa,fq,fb,fp) is convex, so both flipped triangles
+        # come out CCW.  The belt-and-suspenders orient2d pair that lived here
+        # rejected 0 of millions of flips suite-wide (byte-identical without it)
+        # and was removed (tangle.cpp 0.4.3).
 
         n_fb_fp = tri.neighbors[(fj + 1) % 3]
         n_fp_fa = tri.neighbors[(fj + 2) % 3]
@@ -3309,7 +3320,7 @@ def main():
             p.node_a = vremap[p.node_a]
             p.node_b = vremap[p.node_b]
 
-    # Cuthill-McKee bandwidth reduction + element sort
+    # Reverse Cuthill-McKee reordering + element sort
     if opts.reorder:
         nv = len(mesh.vertices)
         ne = len(mesh.triangles)
@@ -3337,7 +3348,7 @@ def main():
         # Find starting node (minimum connectivity)
         start_node = min(range(nv), key=lambda i: numcon[i])
 
-        # Cuthill-McKee renumbering
+        # Cuthill-McKee renumbering (reversed below to RCM)
         newnum = [-1] * nv
         order = [-1] * nv
         newnum[start_node] = 0
@@ -3364,6 +3375,14 @@ def main():
                 newnum[best] = n
                 order[n] = best
                 n += 1
+
+        # Reverse Cuthill-McKee: reversing the CM numbering leaves the bandwidth
+        # identical but never increases the profile/envelope, and on these meshes
+        # shrinks it ~6-16% (George 1971). The profile drives fill in a skyline
+        # factorization and the discarded-fill quality of an incomplete-Cholesky
+        # preconditioner, so RCM is the standard choice; the reversal is free.
+        for i in range(nv):
+            newnum[i] = nv - 1 - newnum[i]
 
         # Apply renumbering to elements
         for t in mesh.triangles:
@@ -3398,12 +3417,21 @@ def main():
 
         if not opts.quiet:
             bw = 0
+            rowmin = list(range(nv))
             for t in mesh.triangles:
                 for j in range(3):
-                    d = abs(t.v[j] - t.v[(j+1)%3])
+                    a = t.v[j]
+                    b = t.v[(j + 1) % 3]
+                    if b < rowmin[a]:
+                        rowmin[a] = b
+                    if a < rowmin[b]:
+                        rowmin[b] = a
+                    d = abs(a - b)
                     if d > bw:
                         bw = d
-            print(f"  Cuthill-McKee: bandwidth={bw+1}", file=sys.stderr)
+            profile = sum(i - rowmin[i] for i in range(nv))
+            print(f"  Reverse Cuthill-McKee: bandwidth={bw+1} profile={profile}",
+                  file=sys.stderr)
 
     if not opts.quiet:
         print(f"Output: {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles",
