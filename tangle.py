@@ -3400,20 +3400,13 @@ def main():
                 newnum[i], newnum[j] = newnum[j], newnum[i]
                 mesh.vertices[i], mesh.vertices[j] = mesh.vertices[j], mesh.vertices[i]
 
-        # Sort elements by vertex sum (comb sort)
-        score = [t.v[0] + t.v[1] + t.v[2] for t in mesh.triangles]
-        gap = ne
-        swapped = True
-        while gap > 1 or swapped:
-            gap = max(1, (gap * 10) // 13)
-            if gap in (9, 10):
-                gap = 11
-            swapped = False
-            for i in range(ne - gap):
-                if score[i] > score[i + gap]:
-                    score[i], score[i + gap] = score[i + gap], score[i]
-                    mesh.triangles[i], mesh.triangles[i + gap] = mesh.triangles[i + gap], mesh.triangles[i]
-                    swapped = True
+        # Sort elements by vertex-index sum so elements sharing nodes are stored
+        # adjacently.  Python's built-in sort is Timsort (C-implemented,
+        # O(n log n)) and STABLE, so equal-sum elements keep their original
+        # ascending-index order -- the same deterministic result as tangle.cpp's
+        # index-sort with an original-index tie-break, and far faster than the
+        # pure-Python comb sort it replaces.
+        mesh.triangles.sort(key=lambda t: t.v[0] + t.v[1] + t.v[2])
 
         if not opts.quiet:
             bw = 0
