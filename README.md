@@ -1,6 +1,6 @@
 # tangle
 
-**Version 0.4.2** — 14 Jun 2026
+**Version 0.4.3** — 25 Jun 2026
 
 A 2D constrained Delaunay triangulation and quality mesh generation tool,
 implemented in C++17. File format compatible with Shewchuk's
@@ -72,7 +72,7 @@ tangle [switches] inputfile
 | `-I`   | Suppress iteration numbers on output filenames |
 | `-j`   | Jettison unused vertices from output |
 | `-P`   | Suppress .poly file output |
-| `-R`   | Reorder nodes (Cuthill-McKee bandwidth reduction) |
+| `-R`   | Reorder nodes (reverse Cuthill-McKee bandwidth/profile reduction) |
 | `-x`   | Write stamp file (`.tstamp`) with mesh nodes and non-segment edges |
 | `-g`   | Convert a FEMM file (`.fem`/`.fee`/`.feh`/`.fec`) to a standalone `<base>_pslg.poly` and exit (no meshing). |
 
@@ -182,10 +182,10 @@ SmartMesh and per-segment `MaxSideLength` constraints are translated to LFS
 values. PBC and AGE boundary types are detected from `BdryFormat` codes and
 handled automatically.
 
-### 9. Node Reordering — Cuthill-McKee Algorithm
+### 9. Node Reordering — Reverse Cuthill-McKee (RCM)
 
-When the `-R` flag is given (or automatically for FEMM files), tangle reorders the mesh nodes using the [Cuthill-McKee algorithm](https://en.wikipedia.org/wiki/Cuthill%E2%80%93McKee_algorithm)
-([Cuthill & McKee 1969](https://doi.org/10.1145/800195.805928)) to reduce the bandwidth of the resulting finite element stiffness matrix.
+When the `-R` flag is given (or automatically for FEMM files), tangle reorders the mesh nodes using [reverse Cuthill-McKee (RCM)](https://en.wikipedia.org/wiki/Cuthill%E2%80%93McKee_algorithm)
+([Cuthill & McKee 1969](https://doi.org/10.1145/800195.805928)) to reduce the bandwidth and profile of the resulting finite element stiffness matrix.
 
 The algorithm builds a node adjacency graph from the element topology, then
 performs a breadth-first traversal starting from the node with minimum
@@ -193,6 +193,12 @@ connectivity. At each step, unvisited neighbors are appended in order of
 ascending connectivity (degree), which tends to keep nearby nodes close
 together in the new numbering. Disconnected components are handled by
 restarting the BFS from the lowest-connectivity unvisited node.
+
+The resulting Cuthill-McKee numbering is then **reversed**. The reversal leaves
+the bandwidth unchanged but never increases the profile (envelope) and in
+practice shrinks it noticeably (George 1971). The profile is what governs fill in a profile/skyline factorization and the
+discarded-fill quality of an incomplete-Cholesky preconditioner, so RCM is the
+standard choice over plain Cuthill-McKee; the reversal itself is free.
 
 After renumbering, elements are sorted by the sum of their vertex indices so that elements sharing nodes are stored adjacently. Together, these two reorderings improve cache locality and reduce the
 bandwidth of sparse matrix storage formats used by direct and iterative FEM solvers.
