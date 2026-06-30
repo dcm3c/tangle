@@ -5,7 +5,7 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.6
+// Version 0.4.7
 // 05 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
@@ -71,6 +71,19 @@
 #define TANGLE_HAVE_MXCSR 1
 #include <xmmintrin.h>
 #endif
+
+// Process exit / library return status. Each distinct failure egress gets its
+// own code so a caller (notably femm-qt's "Mesher failed (error N)") can tell a
+// missing file from a parse error from a real meshing failure. Keep in sync with
+// the copy in tangle_mesh.h.
+enum TangleStatus {
+    TANGLE_OK          = 0,  // success
+    TANGLE_ERR_USAGE   = 1,  // bad invocation: no args / no input file named
+    TANGLE_ERR_NO_FILE = 2,  // input file not found / could not be opened
+    TANGLE_ERR_PARSE   = 3,  // file opened but could not be parsed
+    TANGLE_ERR_MESH    = 4,  // meshing failed (e.g. a segment could not be enforced)
+    TANGLE_ERR_OPTION  = 5,  // option not valid for this input (e.g. -g on a non-FEMM file)
+};
 
 
 struct PairHash {
@@ -4405,7 +4418,7 @@ void printUsage(){
 // downstream solve, so callers must produce no output at all.
 // ============================================================
 
-static bool runMeshPipeline(Mesh& mesh, const Options& opts)
+static int runMeshPipeline(Mesh& mesh, const Options& opts)
 {
 #ifdef TANGLE_HAVE_MXCSR
     // Pin the SSE control word to the IEEE default while meshing, then restore.
@@ -4528,7 +4541,7 @@ static bool runMeshPipeline(Mesh& mesh, const Options& opts)
                        "The mesh would be unusable, so no output is written. Try -C\n"
                        "(optionally with a larger tolerance) or repair the input\n"
                        "geometry near the listed segments.\n";
-            return false;
+            return TANGLE_ERR_MESH;
         }
     }
 
@@ -4744,12 +4757,12 @@ static bool runMeshPipeline(Mesh& mesh, const Options& opts)
 
     if(!opts.quiet)
         std::cerr<<"Output: "<<mesh.vertices.size()<<" vertices, "<<mesh.triangles.size()<<" triangles\n";
-    return true;
+    return TANGLE_OK;
 }
 
 #ifndef TANGLE_AS_LIBRARY
 int main(int argc, char* argv[]){
-    if(argc<2){printUsage();return 1;}
+    if(argc<2){printUsage();return TANGLE_ERR_USAGE;}
 
     std::string switchStr, inputFile;
     for(int i=1;i<argc;i++){
@@ -4757,7 +4770,7 @@ int main(int argc, char* argv[]){
         if(arg[0]=='-') switchStr+=arg.substr(1);
         else inputFile=arg;
     }
-    if(inputFile.empty()){std::cerr<<"No input file specified.\n";return 1;}
+    if(inputFile.empty()){std::cerr<<"No input file specified.\n";return TANGLE_ERR_USAGE;}
 
     Options opts=parseOptions(switchStr);
 
@@ -4778,6 +4791,13 @@ int main(int argc, char* argv[]){
     }
     if(ext.empty()){ext=opts.pslg?".poly":".node";inputFile+=ext;}
 
+    // Separate "file not found" from "file unparseable" so the two get distinct
+    // exit codes: probe existence first, then a reader failure means a parse error.
+    {
+        std::ifstream probe(inputFile);
+        if(!probe.good()){std::cerr<<"Cannot open "<<inputFile<<"\n";return TANGLE_ERR_NO_FILE;}
+    }
+
     Mesh mesh;
     int nAttribs=0, nMarkers=0;
 
@@ -4786,15 +4806,15 @@ int main(int argc, char* argv[]){
 
     if(isFem){
         if(!readFemFile(inputFile,mesh.vertices,mesh.segments,mesh.holes,mesh.regions,opts,mesh.age_defs))
-            return 1;
+            return TANGLE_ERR_PARSE;
     } else if(opts.pslg||ext==".poly"){
         opts.pslg=true;
         if(!readPolyFile(inputFile,mesh,nAttribs))
-            return 1;
+            return TANGLE_ERR_PARSE;
         // readPolyFile tags PBC segments with pbc_type;
         // buildPbcTwinFromCDT (after hole removal) handles node pairing.
     } else {
-        if(!readNodeFile(inputFile,mesh.vertices,nAttribs,nMarkers)) return 1;
+        if(!readNodeFile(inputFile,mesh.vertices,nAttribs,nMarkers)) return TANGLE_ERR_PARSE;
     }
 
     if(!opts.quiet){
@@ -4811,7 +4831,7 @@ int main(int argc, char* argv[]){
         if(!isFem){
             std::cerr<<"Error: -g generates a .poly from a FEMM input file "
                        "(.fem/.fee/.feh/.fec); '"<<inputFile<<"' is not one.\n";
-            return 1;
+            return TANGLE_ERR_OPTION;
         }
         // Distinct name (<base>_pslg.poly) so it never clobbers an existing .poly.
         std::string fn=base+"_pslg.poly";
@@ -4832,10 +4852,10 @@ int main(int argc, char* argv[]){
             f<<(i+off)<<" "<<mesh.regions[i].x<<" "<<mesh.regions[i].y<<" "<<mesh.regions[i].attrib<<" "<<mesh.regions[i].max_area<<"\n";
         if(!opts.quiet) std::cerr<<"Wrote PSLG to "<<fn<<" ("<<mesh.vertices.size()<<" verts, "
             <<mesh.segments.size()<<" segs, "<<mesh.holes.size()<<" holes, "<<mesh.regions.size()<<" regions)\n";
-        return 0;
+        return TANGLE_OK;
     }
 
-    if(!runMeshPipeline(mesh, opts)) return 1;
+    if(int rc=runMeshPipeline(mesh, opts)) return rc;
 
     std::string outBase=base+(opts.suppress_iter?"":".1");
     writeNodeFile(outBase+".node",mesh.vertices,nAttribs,nMarkers>0||opts.pslg,opts);
@@ -4890,7 +4910,7 @@ int main(int argc, char* argv[]){
         if(opts.stamp) std::cerr<<", "<<base<<".tstamp";
         std::cerr<<"\n";
     }
-    return 0;
+    return TANGLE_OK;
 }
 #endif // TANGLE_AS_LIBRARY
 
@@ -4922,7 +4942,7 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
     }
     if(ext.empty()){
         std::cerr << "Could not find .fem file for: " << inputBase << "\n";
-        return 1;
+        return TANGLE_ERR_NO_FILE;
     }
 
     Options opts;
@@ -4930,7 +4950,7 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
 
     if(!readFemFile(inputFile, mesh.vertices, mesh.segments, mesh.holes,
                     mesh.regions, opts, mesh.age_defs))
-        return 1;
+        return TANGLE_ERR_PARSE;
 
     opts.quiet = true;  // suppress meshing diagnostics when called as library
 
@@ -4941,8 +4961,8 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
         std::cerr<<"\n";
     }
 
-    if(!runMeshPipeline(mesh, opts)) return 1;
+    if(int rc=runMeshPipeline(mesh, opts)) return rc;
 
     outMesh = std::move(mesh);
-    return 0;
+    return TANGLE_OK;
 }
