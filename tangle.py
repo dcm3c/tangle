@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.3
-25 Jun 2026
+Version 0.4.9
+30 Jun 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -3083,10 +3083,22 @@ def build_pbc_twin_from_cdt(mesh):
         bdry_pairs = new_pairs
 
 
+# Process exit status. Each distinct failure egress gets its own code so a caller
+# can tell a missing file from a parse error from a real meshing failure. Mirrors
+# the TangleStatus enum in tangle.cpp. (5 = OPTION is unused in this .py CLI, which
+# has no -g/FEMM paths, but is kept for parity with the shared contract.)
+TANGLE_OK          = 0
+TANGLE_ERR_USAGE   = 1
+TANGLE_ERR_NO_FILE = 2
+TANGLE_ERR_PARSE   = 3
+TANGLE_ERR_MESH    = 4
+TANGLE_ERR_OPTION  = 5
+
+
 def main():
     if len(sys.argv) < 2:
         print_usage()
-        return 1
+        return TANGLE_ERR_USAGE
 
     switch_str = ''
     input_file = ''
@@ -3097,7 +3109,7 @@ def main():
             input_file = arg
     if not input_file:
         print("No input file specified.", file=sys.stderr)
-        return 1
+        return TANGLE_ERR_USAGE
 
     opts = parse_options(switch_str)
 
@@ -3117,18 +3129,27 @@ def main():
     n_attribs = 0
     n_markers = 0
 
-    if opts.pslg or ext == '.poly':
-        opts.pslg = True
-        pts, segs, holes, regions, n_attribs = read_poly_file(input_file)
-        mesh.vertices = pts
-        mesh.segments = segs
-        mesh.holes = holes
-        mesh.regions = regions
+    try:
+        if opts.pslg or ext == '.poly':
+            opts.pslg = True
+            pts, segs, holes, regions, n_attribs = read_poly_file(input_file)
+            mesh.vertices = pts
+            mesh.segments = segs
+            mesh.holes = holes
+            mesh.regions = regions
 
-        # PBC node pairing is handled by build_pbc_twin_from_cdt after hole removal.
-    else:
-        pts, n_attribs, n_markers = read_node_file(input_file)
-        mesh.vertices = pts
+            # PBC node pairing is handled by build_pbc_twin_from_cdt after hole removal.
+        else:
+            pts, n_attribs, n_markers = read_node_file(input_file)
+            mesh.vertices = pts
+    except OSError:
+        # Input file not found / could not be opened.
+        print(f"Cannot open {input_file}", file=sys.stderr)
+        return TANGLE_ERR_NO_FILE
+    except (ValueError, IndexError) as e:
+        # File opened but could not be parsed.
+        print(f"Error parsing {input_file}: {e}", file=sys.stderr)
+        return TANGLE_ERR_PARSE
 
     # Shift coordinates to near the origin to maximize floating-point precision.
     shift_x, shift_y = 0.0, 0.0
@@ -3237,7 +3258,7 @@ def main():
                 "splitting (listed above as UNENFORCED). The mesh would be unusable,\n"
                 "so no output is written. Try -C (optionally with a larger\n"
                 "tolerance) or repair the input geometry near the listed segments.\n")
-            sys.exit(1)
+            return TANGLE_ERR_MESH
 
     if not opts.quiet:
         print(f"  CDT: {elapsed():.1f} ms", file=sys.stderr)
@@ -3459,7 +3480,7 @@ def main():
             msg += f", {out_base}.pbc"
         print(msg, file=sys.stderr)
 
-    return 0
+    return TANGLE_OK
 
 
 if __name__ == '__main__':
