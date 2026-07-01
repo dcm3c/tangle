@@ -5,8 +5,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.7
-// 05 Jul 2026
+// Version 0.4.8
+// 30 Jun 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -46,6 +46,7 @@
 #include <chrono>
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <vector>
 #include <array>
@@ -84,6 +85,24 @@ enum TangleStatus {
     TANGLE_ERR_MESH    = 4,  // meshing failed (e.g. a segment could not be enforced)
     TANGLE_ERR_OPTION  = 5,  // option not valid for this input (e.g. -g on a non-FEMM file)
 };
+
+// Build a filesystem::path from a UTF-8 std::string so non-ASCII paths open on
+// Windows. A narrow std::ifstream/ofstream on a std::string uses the ANSI code
+// page and cannot open a path containing characters outside it (e.g. an umlaut
+// in a user or model folder); routing through filesystem::path opens via the
+// wide (_wfopen) API instead. Pass-through on POSIX, where UTF-8 is already the
+// native encoding, so ASCII paths are byte-identical everywhere. Callers pass
+// UTF-8 (femm-qt's Qt paths and tangle's own derived names already are). Uses the
+// non-deprecated UTF-8 entry point for each C++ standard.
+static inline std::filesystem::path fsPath(const std::string& p){
+#if defined(__cpp_lib_char8_t)
+    std::u8string u8(p.size(), u8'\0');                 // C++20: char8_t path ctor
+    for(std::size_t i = 0; i < p.size(); ++i) u8[i] = static_cast<char8_t>(p[i]);
+    return std::filesystem::path(std::move(u8));
+#else
+    return std::filesystem::u8path(p);                  // C++17: u8path (not deprecated here)
+#endif
+}
 
 
 struct PairHash {
@@ -2786,7 +2805,7 @@ struct TokScan {
     const char* p=nullptr;
     const char* end=nullptr;
     bool load(const std::string& fn){
-        std::ifstream f(fn, std::ios::binary);
+        std::ifstream f(fsPath(fn), std::ios::binary);
         if(!f) return false;
         f.seekg(0, std::ios::end);
         std::streamsize sz=f.tellg();
@@ -3066,7 +3085,7 @@ bool readFemFile(const std::string& filename,
                  Options& opts,
                  std::vector<AGEDef>& ageDefs)
 {
-    std::ifstream f(filename);
+    std::ifstream f(fsPath(filename));
     if(!f){std::cerr<<"Cannot open "<<filename<<"\n";return false;}
 
     // Detect file type from extension
@@ -3766,7 +3785,7 @@ inline void flushIfBig(std::ofstream& f, std::string& s){
 
 void writeNodeFile(const std::string& fn, const std::vector<Point>& pts,
                    int nAttribs, bool hasMarkers, const Options& opts){
-    std::ofstream f(fn);
+    std::ofstream f(fsPath(fn));
     bool hasLfs=false;
     if(!opts.no_lfs_output)
         for(auto& p:pts) if(p.lfs>0){hasLfs=true;break;}
@@ -3786,7 +3805,7 @@ void writeNodeFile(const std::string& fn, const std::vector<Point>& pts,
 }
 
 void writeEleFile(const std::string& fn, const Mesh& mesh, bool hasAttrib, const Options& opts){
-    std::ofstream f(fn);
+    std::ofstream f(fsPath(fn));
     std::string out; out.reserve(1u<<20);
     appendInt(out,(long long)mesh.triangles.size()); out+=" 3 "; appendInt(out,hasAttrib?1:0); out+='\n';
     for(int i=0;i<(int)mesh.triangles.size();i++){
@@ -3803,7 +3822,7 @@ void writeEleFile(const std::string& fn, const Mesh& mesh, bool hasAttrib, const
 }
 
 void writeEdgeFile(const std::string& fn, const Mesh& mesh, const Options& opts){
-    std::ofstream f(fn);
+    std::ofstream f(fsPath(fn));
     // Build map from edge to segment marker
     std::unordered_map<std::pair<int,int>,int,PairHash> segMarker;
     segMarker.reserve(mesh.segments.size()*2+8);
@@ -3844,7 +3863,7 @@ void writeEdgeFile(const std::string& fn, const Mesh& mesh, const Options& opts)
 }
 
 void writeNeighFile(const std::string& fn, const Mesh& mesh, const Options& opts){
-    std::ofstream f(fn);
+    std::ofstream f(fsPath(fn));
     std::string out; out.reserve(1u<<20);
     appendInt(out,(long long)mesh.triangles.size()); out+=" 3\n";
     auto nb=[&](int n)->int{return(n<0)?-1:(opts.zero_indexed?n:(n+1));};
@@ -3860,7 +3879,7 @@ void writeNeighFile(const std::string& fn, const Mesh& mesh, const Options& opts
 }
 
 void writePolyFile(const std::string& fn, const Mesh& mesh, const Options& opts){
-    std::ofstream f(fn);
+    std::ofstream f(fsPath(fn));
     bool hasSegLfs=false;
     for(auto& s:mesh.segments) if(s.lfs>0){hasSegLfs=true;break;}
     std::string out; out.reserve(1u<<20);
@@ -3884,7 +3903,7 @@ void writePolyFile(const std::string& fn, const Mesh& mesh, const Options& opts)
 }
 
 void writePbcFile(const std::string& fn, const Mesh& mesh, const Options& opts){
-    std::ofstream f(fn);
+    std::ofstream f(fsPath(fn));
     f<<std::setprecision(17);
     f<<mesh.pbc_pairs.size()<<"\n";
     for(int i=0;i<(int)mesh.pbc_pairs.size();i++){
@@ -4782,10 +4801,10 @@ int main(int argc, char* argv[]){
         // two-step mesher invokes us with a bare name (and -p) and a deliberately
         // crafted .poly that must be honored even when the model's .fem sits in
         // the same directory. Only auto-detect a FEMM file when no .poly exists.
-        std::ifstream polyTest(inputFile+".poly");
+        std::ifstream polyTest(fsPath(inputFile+".poly"));
         if(polyTest.good()){ext=".poly";inputFile+=ext;}
         else for(auto tryExt:{".fem",".fee",".feh",".fec"}){
-            std::ifstream test(inputFile+tryExt);
+            std::ifstream test(fsPath(inputFile+tryExt));
             if(test.good()){ext=tryExt;inputFile+=ext;base=inputFile.substr(0,inputFile.size()-4);break;}
         }
     }
@@ -4794,7 +4813,7 @@ int main(int argc, char* argv[]){
     // Separate "file not found" from "file unparseable" so the two get distinct
     // exit codes: probe existence first, then a reader failure means a parse error.
     {
-        std::ifstream probe(inputFile);
+        std::ifstream probe(fsPath(inputFile));
         if(!probe.good()){std::cerr<<"Cannot open "<<inputFile<<"\n";return TANGLE_ERR_NO_FILE;}
     }
 
@@ -4835,7 +4854,7 @@ int main(int argc, char* argv[]){
         }
         // Distinct name (<base>_pslg.poly) so it never clobbers an existing .poly.
         std::string fn=base+"_pslg.poly";
-        std::ofstream f(fn);
+        std::ofstream f(fsPath(fn));
         f<<std::setprecision(17);
         const int off = opts.zero_indexed?0:1;
         f<<mesh.vertices.size()<<" 2 0 1\n";
@@ -4888,7 +4907,7 @@ int main(int argc, char* argv[]){
 
         int nv=(int)mesh.vertices.size();
         std::string stampFile=base+".tstamp";
-        std::ofstream sf(stampFile);
+        std::ofstream sf(fsPath(stampFile));
         sf<<std::setprecision(15);
         sf<<nv<<" "<<stampEdges.size()<<"\n";
         for(int i=0;i<nv;i++)
@@ -4936,7 +4955,7 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
     if(ext.empty()){
         // Bare base (the usual caller): probe for an existing FEMM file, .fem first.
         for(auto tryExt : {".fem", ".fee", ".feh", ".fec"}){
-            std::ifstream test(inputFile + tryExt);
+            std::ifstream test(fsPath(inputFile + tryExt));
             if(test.good()){ ext = tryExt; inputFile += ext; break; }
         }
     }

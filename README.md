@@ -45,7 +45,9 @@ which documents the full extended `.poly` format.
 g++ -O3 -std=c++17 -static -o tangle tangle.cpp float256.cpp -lm
 ```
 
-No external dependencies. Requires a C++17 compiler (GCC, Clang, or MSVC).
+No external dependencies. Requires a C++17 compiler with `<filesystem>` (GCC ≥ 9,
+Clang ≥ 9, MSVC 2019+; macOS deployment target ≥ 10.15). Older toolchains also
+need `-lstdc++fs` (GCC 7–8) or `-lc++fs` (older libc++).
 
 Pre-built Windows binaries are available at
 [https://www.femm.info/wiki/Tangle](https://www.femm.info/wiki/Tangle).
