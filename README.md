@@ -42,12 +42,18 @@ which documents the full extended `.poly` format.
 ## Build
 
 ```bash
-g++ -O3 -std=c++17 -static -o tangle tangle.cpp float256.cpp -lm
+# Windows (MinGW): -municode is required (the CLI entry point is wmain)
+g++ -O3 -std=c++17 -municode -static -o tangle tangle.cpp float256.cpp -lm
+
+# Linux / macOS: omit -municode (the entry point is a plain main)
+g++ -O3 -std=c++17 -o tangle tangle.cpp float256.cpp -lm
 ```
 
 No external dependencies. Requires a C++17 compiler with `<filesystem>` (GCC ≥ 9,
 Clang ≥ 9, MSVC 2019+; macOS deployment target ≥ 10.15). Older toolchains also
-need `-lstdc++fs` (GCC 7–8) or `-lc++fs` (older libc++).
+need `-lstdc++fs` (GCC 7–8) or `-lc++fs` (older libc++). On Windows, `-municode`
+makes the CLI receive its arguments as UTF-8 (wide command line) so non-ASCII
+input paths work.
 
 Pre-built Windows binaries are available at
 [https://www.femm.info/wiki/Tangle](https://www.femm.info/wiki/Tangle).

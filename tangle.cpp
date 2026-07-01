@@ -5,7 +5,7 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.8
+// Version 0.4.9
 // 30 Jun 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
@@ -94,14 +94,25 @@ enum TangleStatus {
 // native encoding, so ASCII paths are byte-identical everywhere. Callers pass
 // UTF-8 (femm-qt's Qt paths and tangle's own derived names already are). Uses the
 // non-deprecated UTF-8 entry point for each C++ standard.
+//
+// Never throws: the UTF-8->native conversion raises filesystem_error on an
+// invalid byte sequence (e.g. an ANSI-mangled path), which as an uncaught
+// exception would crash the process -- and for the library entry would take down
+// the host (femm-qt) instead of returning an error code. On bad input, fall back
+// to interpreting the bytes in the native encoding; a wrong path then simply
+// fails to open (NO_FILE) rather than terminating.
 static inline std::filesystem::path fsPath(const std::string& p){
+    try {
 #if defined(__cpp_lib_char8_t)
-    std::u8string u8(p.size(), u8'\0');                 // C++20: char8_t path ctor
-    for(std::size_t i = 0; i < p.size(); ++i) u8[i] = static_cast<char8_t>(p[i]);
-    return std::filesystem::path(std::move(u8));
+        std::u8string u8(p.size(), u8'\0');             // C++20: char8_t path ctor
+        for(std::size_t i = 0; i < p.size(); ++i) u8[i] = static_cast<char8_t>(p[i]);
+        return std::filesystem::path(std::move(u8));
 #else
-    return std::filesystem::u8path(p);                  // C++17: u8path (not deprecated here)
+        return std::filesystem::u8path(p);              // C++17: u8path (not deprecated here)
 #endif
+    } catch(const std::exception&){
+        return std::filesystem::path(p);                // not valid UTF-8: native-encoding fallback
+    }
 }
 
 
@@ -4780,12 +4791,17 @@ static int runMeshPipeline(Mesh& mesh, const Options& opts)
 }
 
 #ifndef TANGLE_AS_LIBRARY
-int main(int argc, char* argv[]){
+
+// The standalone CLI body. Takes already-decoded UTF-8 arguments (args[0] is the
+// program name) so the entry point can hand it the wide command line on Windows
+// (see wmain below) instead of the ANSI-mangled narrow argv.
+static int tangleMain(const std::vector<std::string>& args){
+    int argc = (int)args.size();
     if(argc<2){printUsage();return TANGLE_ERR_USAGE;}
 
     std::string switchStr, inputFile;
     for(int i=1;i<argc;i++){
-        std::string arg=argv[i];
+        const std::string& arg=args[i];
         if(arg[0]=='-') switchStr+=arg.substr(1);
         else inputFile=arg;
     }
@@ -4931,6 +4947,27 @@ int main(int argc, char* argv[]){
     }
     return TANGLE_OK;
 }
+
+// Entry point. On Windows the narrow argv[] is transcoded through the ANSI code
+// page, which mangles any path character outside it (e.g. an umlaut in a folder),
+// so take the wide command line via wmain (needs -municode) and decode it to UTF-8
+// through the same std::filesystem path fsPath() uses. On POSIX the narrow argv is
+// already UTF-8, so pass it straight through.
+#ifdef _WIN32
+int wmain(int argc, wchar_t* wargv[]){
+    std::vector<std::string> args;
+    args.reserve(argc);
+    for(int i=0;i<argc;i++){
+        auto u = std::filesystem::path(wargv[i]).u8string(); // UTF-16 -> UTF-8
+        args.emplace_back(u.begin(), u.end());
+    }
+    return tangleMain(args);
+}
+#else
+int main(int argc, char* argv[]){
+    return tangleMain(std::vector<std::string>(argv, argv+argc));
+}
+#endif
 #endif // TANGLE_AS_LIBRARY
 
 // ============================================================
