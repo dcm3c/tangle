@@ -48,6 +48,13 @@ struct PBCNodePair {
     int type;
 };
 
+struct PBCDef {
+    // A PBC declaration from the input: the boundary with marker_a pairs with
+    // the boundary with marker_b (.poly form; FEMM inputs share one marker).
+    int marker_a, marker_b;
+    int type; // 0=periodic, 1=anti-periodic
+};
+
 struct AGEDef {
     std::string name;
     int format;
@@ -71,6 +78,7 @@ struct Mesh {
     std::vector<PBCNodePair> pbc_pairs;
     std::map<int,int> pbc_twin;
     std::map<int,int> pbc_node_type;
+    std::vector<PBCDef> pbc_defs;
     std::vector<AGEDef> age_defs;
 
     void rebuildAdjacency();

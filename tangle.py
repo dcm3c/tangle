@@ -7,7 +7,7 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.11
+Version 0.4.12
 03 Jul 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
@@ -302,6 +302,7 @@ class Mesh:
         self.pbc_pairs = []      # list of PBCNodePair, filled after refinement
         self.pbc_twin = {}       # dict: node -> twin node (bidirectional)
         self.pbc_node_type = {}  # dict: node -> pbc type (0 or 1)
+        self.pbc_defs = []       # PBC declarations: (marker_a, marker_b, type)
 
     def rebuild_adjacency(self):
         nt = len(self.triangles)
@@ -2794,6 +2795,7 @@ def read_poly_file(filename):
                         segs.append(Segment(prev_idx, v1a, arc_marker, arc_lfs))
 
     # PBC definitions: pair two boundary markers
+    pbc_defs = []
     tokens, idx = read_tokens(lines, idx)
     if tokens:
         n_pbcs = int(tokens[0])
@@ -2804,8 +2806,11 @@ def read_poly_file(filename):
             for s in segs:
                 if s.marker == marker_a or s.marker == marker_b:
                     s.pbc_type = pbc_type
+            # Record the declaration: build_pbc_twin_from_cdt needs to know
+            # WHICH markers pair when the two chains carry different ones.
+            pbc_defs.append((marker_a, marker_b, pbc_type))
 
-    return pts, segs, holes, regions, n_attribs
+    return pts, segs, holes, regions, n_attribs, pbc_defs
 
 
 def write_node_file(fn, pts, n_attribs, has_markers, opts):
@@ -3045,7 +3050,74 @@ def build_pbc_twin_from_cdt(mesh):
             pbc_boundaries.add((s.marker, s.pbc_type))
 
     bdry_pairs = []
+
+    # Build DIRECTED node chain following CDT segment orientation.
+    def build_directed_chain(seg_indices):
+        if not seg_indices:
+            return []
+        from_v0 = {}
+        degree = {}
+        for si in seg_indices:
+            from_v0.setdefault(mesh.segments[si].v0, []).append(si)
+            degree[mesh.segments[si].v0] = degree.get(mesh.segments[si].v0, 0) + 1
+            degree[mesh.segments[si].v1] = degree.get(mesh.segments[si].v1, 0) + 1
+        # Find chain start: endpoint node (degree 1) that is v0 of some segment
+        start_node = -1
+        for si in seg_indices:
+            v0 = mesh.segments[si].v0
+            if degree.get(v0, 0) == 1:
+                start_node = v0
+                break
+        if start_node < 0:
+            for si in seg_indices:
+                v1 = mesh.segments[si].v1
+                if degree.get(v1, 0) == 1:
+                    start_node = v1
+                    break
+        if start_node < 0:
+            return []
+        chain = [start_node]
+        visited = set()
+        cur_node = start_node
+        while True:
+            found = False
+            for si in from_v0.get(cur_node, []):
+                if si in visited:
+                    continue
+                visited.add(si)
+                chain.append(mesh.segments[si].v1)
+                cur_node = mesh.segments[si].v1
+                found = True
+                break
+            if not found:
+                for si in seg_indices:
+                    if si in visited:
+                        continue
+                    if mesh.segments[si].v1 == cur_node:
+                        visited.add(si)
+                        chain.append(mesh.segments[si].v0)
+                        cur_node = mesh.segments[si].v0
+                        found = True
+                        break
+            if not found:
+                break
+        return chain
+
+    # Markers belonging to a cross-marker declaration (.poly "markerA markerB
+    # type" with markerA != markerB) are paired BY DECLARATION below. The
+    # two-chains-in-one-marker-group scan cannot see that pairing: each such
+    # group holds only ONE chain, so it used to fall through silently, leaving
+    # pbc_twin empty — refinement then split the two boundaries independently
+    # and they could desynchronize (wedge_pbc: 6 vs 5 nodes on the twin edges).
+    cross_markers = set()
+    for marker_a, marker_b, pbc_type in mesh.pbc_defs:
+        if marker_a != marker_b:
+            cross_markers.add(marker_a)
+            cross_markers.add(marker_b)
+
     for marker, pbc_type in pbc_boundaries:
+        if marker in cross_markers:
+            continue
         all_segs = [si for si, s in enumerate(mesh.segments)
                     if s.marker == marker and s.pbc_type == pbc_type]
 
@@ -3078,60 +3150,27 @@ def build_pbc_twin_from_cdt(mesh):
         if not sl1 or not sl2:
             continue
 
-        # Build DIRECTED node chain following CDT segment orientation.
-        def build_directed_chain(seg_indices):
-            if not seg_indices:
-                return []
-            from_v0 = {}
-            degree = {}
-            for si in seg_indices:
-                from_v0.setdefault(mesh.segments[si].v0, []).append(si)
-                degree[mesh.segments[si].v0] = degree.get(mesh.segments[si].v0, 0) + 1
-                degree[mesh.segments[si].v1] = degree.get(mesh.segments[si].v1, 0) + 1
-            # Find chain start: endpoint node (degree 1) that is v0 of some segment
-            start_node = -1
-            for si in seg_indices:
-                v0 = mesh.segments[si].v0
-                if degree.get(v0, 0) == 1:
-                    start_node = v0
-                    break
-            if start_node < 0:
-                for si in seg_indices:
-                    v1 = mesh.segments[si].v1
-                    if degree.get(v1, 0) == 1:
-                        start_node = v1
-                        break
-            if start_node < 0:
-                return []
-            chain = [start_node]
-            visited = set()
-            cur_node = start_node
-            while True:
-                found = False
-                for si in from_v0.get(cur_node, []):
-                    if si in visited:
-                        continue
-                    visited.add(si)
-                    chain.append(mesh.segments[si].v1)
-                    cur_node = mesh.segments[si].v1
-                    found = True
-                    break
-                if not found:
-                    for si in seg_indices:
-                        if si in visited:
-                            continue
-                        if mesh.segments[si].v1 == cur_node:
-                            visited.add(si)
-                            chain.append(mesh.segments[si].v0)
-                            cur_node = mesh.segments[si].v0
-                            found = True
-                            break
-                if not found:
-                    break
-            return chain
-
         chain1 = build_directed_chain(sl1)
         chain2 = build_directed_chain(sl2)
+        if not chain1 or not chain2:
+            continue
+        if len(chain1) != len(chain2):
+            continue
+        bdry_pairs.append((chain1, chain2, pbc_type, False))
+
+    # Cross-marker declarations: one chain per marker, paired by declaration
+    # (chain1 = marker_a's segments, chain2 = marker_b's).
+    for marker_a, marker_b, pbc_type in mesh.pbc_defs:
+        if marker_a == marker_b:
+            continue
+        segs_a = [si for si, s in enumerate(mesh.segments)
+                  if s.pbc_type == pbc_type and s.marker == marker_a]
+        segs_b = [si for si, s in enumerate(mesh.segments)
+                  if s.pbc_type == pbc_type and s.marker == marker_b]
+        if not segs_a or not segs_b:
+            continue
+        chain1 = build_directed_chain(segs_a)
+        chain2 = build_directed_chain(segs_b)
         if not chain1 or not chain2:
             continue
         if len(chain1) != len(chain2):
@@ -3236,7 +3275,8 @@ def main():
     try:
         if opts.pslg or ext == '.poly':
             opts.pslg = True
-            pts, segs, holes, regions, n_attribs = read_poly_file(input_file)
+            pts, segs, holes, regions, n_attribs, pbc_defs = read_poly_file(input_file)
+            mesh.pbc_defs = pbc_defs
             mesh.vertices = pts
             mesh.segments = segs
             mesh.holes = holes

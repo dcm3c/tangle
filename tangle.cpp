@@ -5,7 +5,7 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.11
+// Version 0.4.12
 // 05 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
@@ -338,6 +338,15 @@ struct PBCNodePair {
     int type; // 0=periodic, 1=anti-periodic
 };
 
+struct PBCDef {
+    // A PBC declaration from the input: the boundary with marker_a pairs with
+    // the boundary with marker_b. The .poly form allows the two chains to carry
+    // DIFFERENT markers; FEMM inputs use one shared marker for both (marker_a
+    // == marker_b there, and the .fem reader does not need to record defs).
+    int marker_a, marker_b;
+    int type; // 0=periodic, 1=anti-periodic
+};
+
 struct AGEDef {
     std::string name;
     int format;           // 0=periodic, 1=anti-periodic
@@ -362,6 +371,7 @@ struct Mesh {
     std::vector<PBCNodePair> pbc_pairs; // filled after refinement
     std::map<int,int> pbc_twin;          // node↔twin mapping for PBC boundaries
     std::map<int,int> pbc_node_type;     // node→PBC type (0=periodic, 1=anti-periodic)
+    std::vector<PBCDef> pbc_defs;        // PBC declarations (cross-marker .poly form)
     std::vector<AGEDef> age_defs;        // air gap element definitions
 
     void rebuildAdjacency(){
@@ -2706,7 +2716,81 @@ void buildPbcTwinFromCDT(Mesh& mesh){
     };
     std::vector<BdryPair> bdryPairs;
 
+    // Build DIRECTED node chain following CDT segment orientation.
+    // This is the key difference from the old code: instead of walking
+    // by connectivity (which ignores orientation), we follow v0→v1
+    // direction of each oriented segment, like OF does after reading
+    // Triangle's .edge output.
+    auto buildDirectedChain=[&](const std::vector<int>& segIndices) -> std::vector<int> {
+        if(segIndices.empty()) return {};
+        // Build adjacency: for each node, which segments have it as v0 or v1
+        std::map<int,std::vector<int>> fromV0; // node → segments starting here
+        std::map<int,int> degree;
+        for(int si:segIndices){
+            fromV0[mesh.segments[si].v0].push_back(si);
+            degree[mesh.segments[si].v0]++;
+            degree[mesh.segments[si].v1]++;
+        }
+        // Find chain start: endpoint node (degree 1) that is v0 of some segment
+        int startNode=-1;
+        for(int si:segIndices){
+            int v0=mesh.segments[si].v0;
+            if(degree[v0]==1){ startNode=v0; break; }
+        }
+        // If no oriented start found, try the other endpoint
+        if(startNode<0){
+            for(int si:segIndices){
+                int v1=mesh.segments[si].v1;
+                if(degree[v1]==1){ startNode=v1; break; }
+            }
+        }
+        if(startNode<0) return {};
+        // Walk the chain following oriented direction
+        std::vector<int> chain; chain.push_back(startNode);
+        std::set<int> visited;
+        int curNode=startNode;
+        while(true){
+            bool found=false;
+            // Try following oriented direction: curNode is v0 of some segment
+            for(int si:fromV0[curNode]){
+                if(visited.count(si)) continue;
+                visited.insert(si);
+                chain.push_back(mesh.segments[si].v1);
+                curNode=mesh.segments[si].v1;
+                found=true; break;
+            }
+            if(!found){
+                // Try reverse: curNode is v1 of some segment
+                for(int si:segIndices){
+                    if(visited.count(si)) continue;
+                    if(mesh.segments[si].v1==curNode){
+                        visited.insert(si);
+                        chain.push_back(mesh.segments[si].v0);
+                        curNode=mesh.segments[si].v0;
+                        found=true; break;
+                    }
+                }
+            }
+            if(!found) break;
+        }
+        return chain;
+    };
+
+    // Markers belonging to a cross-marker declaration (.poly "markerA markerB
+    // type" with markerA != markerB) are paired BY DECLARATION below. The
+    // two-chains-in-one-marker-group scan cannot see that pairing: each such
+    // group holds only ONE chain, so it used to fall through silently, leaving
+    // pbc_twin empty — refinement then split the two boundaries independently
+    // and they could desynchronize (wedge_pbc: 6 vs 5 nodes on the twin edges).
+    std::set<int> crossMarkers;
+    for(auto& d:mesh.pbc_defs)
+        if(d.marker_a!=d.marker_b){
+            crossMarkers.insert(d.marker_a);
+            crossMarkers.insert(d.marker_b);
+        }
+
     for(auto [marker, pbcType]:pbcBoundaries){
+        if(crossMarkers.count(marker)) continue;
         std::vector<int> allSegs;
         for(int si=0;si<(int)mesh.segments.size();si++)
             if(mesh.segments[si].marker==marker && mesh.segments[si].pbc_type==pbcType)
@@ -2738,70 +2822,30 @@ void buildPbcTwinFromCDT(Mesh& mesh){
         auto sl1=extractChain(), sl2=extractChain();
         if(sl1.empty()||sl2.empty()) continue;
 
-        // Build DIRECTED node chain following CDT segment orientation.
-        // This is the key difference from the old code: instead of walking
-        // by connectivity (which ignores orientation), we follow v0→v1
-        // direction of each oriented segment, like OF does after reading
-        // Triangle's .edge output.
-        auto buildDirectedChain=[&](const std::vector<int>& segIndices) -> std::vector<int> {
-            if(segIndices.empty()) return {};
-            // Build adjacency: for each node, which segments have it as v0 or v1
-            std::map<int,std::vector<int>> fromV0; // node → segments starting here
-            std::map<int,int> degree;
-            for(int si:segIndices){
-                fromV0[mesh.segments[si].v0].push_back(si);
-                degree[mesh.segments[si].v0]++;
-                degree[mesh.segments[si].v1]++;
-            }
-            // Find chain start: endpoint node (degree 1) that is v0 of some segment
-            int startNode=-1;
-            for(int si:segIndices){
-                int v0=mesh.segments[si].v0;
-                if(degree[v0]==1){ startNode=v0; break; }
-            }
-            // If no oriented start found, try the other endpoint
-            if(startNode<0){
-                for(int si:segIndices){
-                    int v1=mesh.segments[si].v1;
-                    if(degree[v1]==1){ startNode=v1; break; }
-                }
-            }
-            if(startNode<0) return {};
-            // Walk the chain following oriented direction
-            std::vector<int> chain; chain.push_back(startNode);
-            std::set<int> visited;
-            int curNode=startNode;
-            while(true){
-                bool found=false;
-                // Try following oriented direction: curNode is v0 of some segment
-                for(int si:fromV0[curNode]){
-                    if(visited.count(si)) continue;
-                    visited.insert(si);
-                    chain.push_back(mesh.segments[si].v1);
-                    curNode=mesh.segments[si].v1;
-                    found=true; break;
-                }
-                if(!found){
-                    // Try reverse: curNode is v1 of some segment
-                    for(int si:segIndices){
-                        if(visited.count(si)) continue;
-                        if(mesh.segments[si].v1==curNode){
-                            visited.insert(si);
-                            chain.push_back(mesh.segments[si].v0);
-                            curNode=mesh.segments[si].v0;
-                            found=true; break;
-                        }
-                    }
-                }
-                if(!found) break;
-            }
-            return chain;
-        };
         auto chain1=buildDirectedChain(sl1), chain2=buildDirectedChain(sl2);
         if(chain1.empty()||chain2.empty()) continue;
         if(chain1.size()!=chain2.size()) continue;
 
         bdryPairs.push_back({chain1, chain2, pbcType});
+    }
+
+    // Cross-marker declarations: one chain per marker, paired by declaration
+    // (chain1 = marker_a's segments, chain2 = marker_b's).
+    for(auto& d:mesh.pbc_defs){
+        if(d.marker_a==d.marker_b) continue;
+        std::vector<int> segsA, segsB;
+        for(int si=0;si<(int)mesh.segments.size();si++){
+            auto& s=mesh.segments[si];
+            if(s.pbc_type!=d.type) continue;
+            if(s.marker==d.marker_a) segsA.push_back(si);
+            else if(s.marker==d.marker_b) segsB.push_back(si);
+        }
+        if(segsA.empty()||segsB.empty()) continue;
+        auto chain1=buildDirectedChain(segsA), chain2=buildDirectedChain(segsB);
+        if(chain1.empty()||chain2.empty()) continue;
+        if(chain1.size()!=chain2.size()) continue;
+
+        bdryPairs.push_back({chain1, chain2, d.type});
     }
 
     // Process boundaries using constraint propagation through shared
@@ -3154,6 +3198,9 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
                         seg.pbc_type=type;
                     }
                 }
+                // Record the declaration: buildPbcTwinFromCDT needs to know
+                // WHICH markers pair when the two chains carry different ones.
+                mesh.pbc_defs.push_back({markerA, markerB, type});
             }
         }
     }
