@@ -5,8 +5,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.4
-// 28 Jun 2026
+// Version 0.4.6
+// 05 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -66,6 +66,11 @@
 #include <numeric>
 #include <queue>
 #include <charconv>
+// SSE control-word access for the FP-environment pin (x86/x86-64 only).
+#if defined(__x86_64__)||defined(_M_X64)||defined(__i386__)||defined(_M_IX86)
+#define TANGLE_HAVE_MXCSR 1
+#include <xmmintrin.h>
+#endif
 
 
 struct PairHash {
@@ -4402,6 +4407,23 @@ void printUsage(){
 
 static bool runMeshPipeline(Mesh& mesh, const Options& opts)
 {
+#ifdef TANGLE_HAVE_MXCSR
+    // Pin the SSE control word to the IEEE default while meshing, then restore.
+    // The mesher has float-sensitive branches near collinear/cocircular geometry;
+    // if a DLL loaded into the host process (e.g. a GPU driver) left a non-default
+    // rounding mode or flush-to-zero/denormals-are-zero in MXCSR, the SAME binary
+    // can take a different path and fail to enforce a segment on one machine but
+    // not another. Forcing round-to-nearest with FTZ/DAZ off makes meshing
+    // reproducible regardless of the host's FP state. Restored on every exit so
+    // the host (e.g. femm-qt) is not disturbed.
+    struct MxcsrGuard {
+        unsigned saved;
+        MxcsrGuard(): saved(_mm_getcsr()){
+            _mm_setcsr(saved & ~0xE040u); // RC->nearest (13-14), FTZ off (15), DAZ off (6)
+        }
+        ~MxcsrGuard(){ _mm_setcsr(saved); }
+    } _mxguard;
+#endif
     // Shift coordinates to near the origin to maximize floating-point precision.
     double shiftX=0, shiftY=0;
     if(!mesh.vertices.empty()){
