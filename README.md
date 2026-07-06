@@ -1,6 +1,6 @@
 # tangle
 
-**Version 0.4.3** — 25 Jun 2026
+**Version 0.4.12** — 3 Jul 2026
 
 A 2D constrained Delaunay triangulation and quality mesh generation tool,
 implemented in C++17. File format compatible with Shewchuk's
@@ -90,6 +90,21 @@ FEMM problem files (`.fem`, `.fee`, `.feh`, `.fec`).
 **Output:** `<base>.1.node`, `<base>.1.ele`, and optionally `.edge`, `.neigh`,
 `.poly`, `.pbc`.
 
+### Exit codes
+
+Each failure mode has a distinct exit code so scripts and host applications
+(e.g. FEMM front-ends calling the library entry `tangle_mesh_fem`) can tell a
+missing file from a bad file from a genuine meshing failure:
+
+| Code | Meaning |
+|------|---------|
+| 0    | success |
+| 1    | usage error (no arguments / no input file named) |
+| 2    | input file not found or could not be opened |
+| 3    | input file opened but could not be parsed |
+| 4    | meshing failed (a segment could not be enforced) |
+| 5    | option not valid for this input (e.g. `-g` on a non-FEMM file) |
+
 ### Example
 
 ```bash
@@ -137,9 +152,14 @@ encroach on any constrained segment (i.e., fall inside the segment's
 diametral circle), or whether the candidate is hidden from its triangle
 behind a constrained segment — a straight-line visibility walk that also
 catches circumcenters lying outside the domain entirely. In either case the
-segment is split at its midpoint instead. This guarantees termination:
-segment splitting resolves encroachment, and the off-center placement ensures
-that new vertices do not create progressively worse triangles.
+segment is split instead of inserting the candidate.
+
+Encroached segments are split at their midpoint — except at corners where
+pure midpoint splitting would lock the corner's two arms into a self-similar
+wedge whose minimum angle sits below the quality bound, a resonance that
+would cascade indefinitely. There the split position is snapped so the
+corner-incident piece aligns with the neighboring arm's innermost segment
+length, which makes the corner wedge isoceles and prevents the cascade.
 
 ### 5. Local Feature Size (LFS) Constraints
 
@@ -167,7 +187,9 @@ endpoint 2.  The number of chord segments is `ceil(angle / max_seg_angle)`.
 ### 7. Periodic Boundary Conditions (PBCs)
 
 PBC definitions pair two boundary chains identified by their segment
-boundary markers.  During quality refinement, PBC-paired segments are split
+boundary markers; the two chains may share a single marker (as FEMM
+boundary properties do) or carry two distinct markers named together in the
+`.poly` PBC declaration.  During quality refinement, PBC-paired segments are split
 synchronously: when the refinement algorithm splits a segment on one chain
 (e.g. because a new Steiner point encroaches on it), it also splits the
 partner segment on the paired chain at the corresponding parametric position.
