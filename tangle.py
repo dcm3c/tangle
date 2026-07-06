@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.9
-30 Jun 2026
+Version 0.4.11
+03 Jul 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -2172,13 +2172,106 @@ def refine_quality(mesh, opts, n_input_verts):
         grid_add_seg(si)
         edge_to_seg[edge_key(mesh.segments[si].v0, mesh.segments[si].v1)] = si
 
-    def split_segment_core(si, out_affected, hint_tri=-1):
-        """Split segment at midpoint. Returns midpoint index or -1 on failure."""
+    # Vertex -> constrained-subsegment neighbor vertices, maintained across
+    # splits. Used by the corner-aligned split rule (split_fraction) below.
+    seg_adj = [[] for _ in range(len(mesh.vertices))]
+    for s in mesh.segments:
+        seg_adj[s.v0].append(s.v1)
+        seg_adj[s.v1].append(s.v0)
+
+    def split_fraction(si):
+        """Corner-aligned split position (anti-resonance rule).
+
+        Pure midpoint splitting pins the innermost subsegment lengths of a
+        corner's two arms to L1/2^k and L2/2^j: their folded ratio is fixed by
+        the input, and the wedge triangle between the innermost rungs is
+        self-similar under halving with an invariant min angle f(theta, ratio).
+        If the quality bound exceeds that invariant and the corner angle is near
+        ~100 deg (where the encroach-split ping-pong sustains), refinement
+        cascades to the FP floor (MotorB tooth roots: theta=97.757, ratio 5.694
+        -> invariant 32.77 deg; see corner_lab.py).
+
+        Cure: when an endpoint is an input-vertex corner in the (88,108)-deg
+        window and the folded-invariant wedge violates the bound, snap the split
+        so this arm's corner-incident length equals the neighbor arm's innermost
+        length (times a power of two, whichever lands in [1/3, 2/3]). Aligned
+        arms make the wedge isoceles (min angle >= (180-theta)/2) so the
+        resonance cannot form. Everywhere else: exact midpoint.
+        """
+        if min_ang_val <= 0.0:
+            return 0.5   # no angle bound -> no resonance possible
+        seg = mesh.segments[si]
+        sa, sb = mesh.vertices[seg.v0], mesh.vertices[seg.v1]
+        sx, sy = sb.x - sa.x, sb.y - sa.y
+        l2seg = sx * sx + sy * sy
+        if l2seg <= 0.0:
+            return 0.5
+        t, best_d = 0.5, 1e9
+        for side in range(2):
+            e = seg.v1 if side else seg.v0
+            far = seg.v0 if side else seg.v1
+            if e >= len(seg_adj):
+                continue
+            pe, pf = mesh.vertices[e], mesh.vertices[far]
+            dx, dy = pf.x - pe.x, pf.y - pe.y
+            for n in seg_adj[e]:
+                if n == far:
+                    continue
+                pn = mesh.vertices[n]
+                ox, oy = pn.x - pe.x, pn.y - pe.y
+                r2 = ox * ox + oy * oy
+                if r2 <= 0.0:
+                    continue
+                dot = dx * ox + dy * oy
+                co = dot / math.sqrt(l2seg * r2)   # cos(corner angle theta)
+                # THE guard: snap iff it flips the corner's limit state from
+                # failing the bound to meeting it. Midpoint dynamics converge to
+                # the folded-ratio wedge; snap dynamics converge to the aligned
+                # isoceles wedge (min angle min(theta, (180-theta)/2)).
+                # (a) The ALIGNED attractor must MEET the bound:
+                #     min_ang <= theta <= 180 - 2*min_ang. This rejects acute
+                #     corners (snapping cannot help; shell/give-up territory) and
+                #     near-collinear junctions (arc-chord chains and every
+                #     Steiner chain vertex), where aligning is meaningless.
+                if co > cos_min_ang:                                  # theta < min_ang
+                    continue
+                if co < 1.0 - 2.0 * cos_min_ang * cos_min_ang:       # theta > 180-2*min_ang
+                    continue
+                # (b) The MIDPOINT attractor must FAIL the bound: fold the
+                #     midpoint ratio (L/2)/r by octaves into [1/sqrt2, sqrt2)
+                #     and test the invariant wedge (sides 1 and rho at theta).
+                #     Transiently-bad-but-convergent states stay midpoint.
+                rho = 0.5 * math.sqrt(l2seg / r2)
+                while rho < 0.70710678118654752:
+                    rho *= 2.0
+                while rho >= 1.4142135623730951:
+                    rho *= 0.5
+                c2 = 1.0 + rho * rho - 2.0 * rho * co
+                if c2 > 0.0:
+                    c = math.sqrt(c2)
+                    cos_a = (1.0 + c2 - rho * rho) / (2.0 * c)          # opposite rho
+                    cos_b = (rho * rho + c2 - 1.0) / (2.0 * rho * c)    # opposite 1
+                    if co <= cos_min_ang and cos_a <= cos_min_ang and cos_b <= cos_min_ang:
+                        continue   # invariant wedge meets the bound: no snap
+                f = math.sqrt(r2 / l2seg)   # neighbor arm length / this length
+                for cand in (0.5 * f, f, 2.0 * f):
+                    if cand < 1.0 / 3.0 or cand > 2.0 / 3.0:
+                        continue
+                    d = abs(cand - 0.5)
+                    if d < best_d:
+                        best_d = d
+                        t = 1.0 - cand if side else cand
+        return t
+
+    def split_segment_core(si, out_affected, hint_tri=-1, t_frac=-1.0):
+        """Split segment (corner-aligned fraction, or forced t_frac for PBC
+        partner sync). Returns split-point index or -1 on failure."""
         seg = Segment(mesh.segments[si].v0, mesh.segments[si].v1,
                       mesh.segments[si].marker, mesh.segments[si].lfs,
                       mesh.segments[si].pbc_type, mesh.segments[si].no_split)
         sa, sb = mesh.vertices[seg.v0], mesh.vertices[seg.v1]
-        mx, my = (sa.x + sb.x) * 0.5, (sa.y + sb.y) * 0.5
+        t = t_frac if 0.0 < t_frac < 1.0 else split_fraction(si)
+        mx, my = sa.x + (sb.x - sa.x) * t, sa.y + (sb.y - sa.y) * t
         mid = Point(mx, my, len(mesh.vertices), seg.marker, [], seg.lfs)
 
         ek = edge_key(seg.v0, seg.v1)
@@ -2202,6 +2295,12 @@ def refine_quality(mesh, opts, n_input_verts):
             shell_apex[mid_idx] = a0
         elif a1 >= 0 and a1 in acute_apices:
             shell_apex[mid_idx] = a1
+        # Maintain the constrained-neighbor adjacency for split_fraction.
+        while len(seg_adj) < len(mesh.vertices):
+            seg_adj.append([])
+        seg_adj[seg.v0] = [mid_idx if nb == seg.v1 else nb for nb in seg_adj[seg.v0]]
+        seg_adj[seg.v1] = [mid_idx if nb == seg.v0 else nb for nb in seg_adj[seg.v1]]
+        seg_adj[mid_idx] = [seg.v0, seg.v1]
         s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_type, seg.no_split)
         s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_type, seg.no_split)
         mesh.segments[si] = s1
@@ -2222,7 +2321,8 @@ def refine_quality(mesh, opts, n_input_verts):
         seg = mesh.segments[si]  # read before split modifies it
         pbc_type = seg.pbc_type
         sv0, sv1 = seg.v0, seg.v1
-        mid_idx = split_segment_core(si, out_affected, hint_tri)
+        t_used = split_fraction(si)
+        mid_idx = split_segment_core(si, out_affected, hint_tri, t_used)
         if mid_idx < 0:
             return False
 
@@ -2235,7 +2335,11 @@ def refine_quality(mesh, opts, n_input_verts):
                 partner_si = edge_to_seg.get(pek, -1)
                 if partner_si >= 0:
                     partner_affected = []
-                    partner_mid = split_segment_core(partner_si, partner_affected)
+                    # Split the partner at the SAME parametric position (oriented:
+                    # partner may be stored with endpoints in either order) so the
+                    # periodic boundaries keep matching node positions.
+                    pt = t_used if mesh.segments[partner_si].v0 == tv0 else 1.0 - t_used
+                    partner_mid = split_segment_core(partner_si, partner_affected, -1, pt)
                     if partner_mid >= 0:
                         mesh.pbc_twin[mid_idx] = partner_mid
                         mesh.pbc_twin[partner_mid] = mid_idx

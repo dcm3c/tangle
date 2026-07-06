@@ -5,8 +5,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.9
-// 30 Jun 2026
+// Version 0.4.11
+// 05 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -2099,11 +2099,114 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     for(int si=0;si<(int)mesh.segments.size();si++)
         edgeToSeg[edgeKey(mesh.segments[si].v0,mesh.segments[si].v1)]=si;
 
-    // Core segment split helper (no PBC synchronization)
-    auto splitSegmentCore=[&](int si, std::vector<int>& outAffected, int hintTri=-1) -> int {
+    // Vertex -> constrained-subsegment neighbor vertices, maintained across
+    // splits. Used by the corner-aligned split rule (splitFraction) below.
+    std::vector<std::vector<int>> segAdj(mesh.vertices.size());
+    for(auto& s : mesh.segments){
+        segAdj[s.v0].push_back(s.v1);
+        segAdj[s.v1].push_back(s.v0);
+    }
+
+    // Corner-aligned split position (anti-resonance rule).
+    //
+    // The default split is the midpoint. But pure midpoint splitting pins the
+    // innermost subsegment lengths of the two arms of a corner to L1/2^k and
+    // L2/2^j — their ratio (folded into [1/sqrt2,sqrt2)) is FIXED by the input
+    // and refinement can never change it. The wedge triangle between the two
+    // innermost rungs is then self-similar under halving, and its min angle is
+    // an invariant f(corner angle, folded ratio). If the quality bound exceeds
+    // that invariant, the wedge is perpetually bad: each fix attempt encroaches
+    // an arm, splits it, and reproduces the same shape at half scale — an
+    // unbounded cascade to the FP floor (MotorB tooth roots: theta=97.757deg,
+    // ratio 5.694 -> invariant 32.77deg, detonates at any bound above it;
+    // deterministic 7-point repro in corner_lab.py).
+    //
+    // Cure: when an endpoint of the segment being split is a genuine corner
+    // (another constrained subsegment leaves it in a non-collinear direction),
+    // snap the split so this arm's new corner-incident length equals the
+    // neighboring arm's innermost length (times a power of two, whichever lands
+    // in [1/3,2/3] of this segment — same 2:1 piece bound as a midpoint would
+    // give within one split). Aligned arms make the wedge isoceles (min angle
+    // >= min(theta,(180-theta)/2)), which meets any bound the corner itself can
+    // meet — the resonance cannot exist. On uniform chains (equal neighbor
+    // lengths) the rule reduces to the exact midpoint, so ordinary segment
+    // chains are unaffected.
+    auto splitFraction=[&](int si) -> double {
+        if(minAng<=0.0) return 0.5;   // no angle bound -> no resonance possible
+        const auto& seg=mesh.segments[si];
+        const auto& sa=mesh.vertices[seg.v0]; const auto& sb=mesh.vertices[seg.v1];
+        double sx=sb.x-sa.x, sy=sb.y-sa.y;
+        double L2seg=sx*sx+sy*sy;
+        if(L2seg<=0.0) return 0.5;
+        double t=0.5, bestD=1e9;
+        for(int side=0; side<2; side++){
+            int e   = side ? seg.v1 : seg.v0;
+            int far = side ? seg.v0 : seg.v1;
+            if(e>=(int)segAdj.size()) continue;
+            const auto& Pe=mesh.vertices[e]; const auto& Pf=mesh.vertices[far];
+            double dx=Pf.x-Pe.x, dy=Pf.y-Pe.y;
+            for(int n : segAdj[e]){
+                if(n==far) continue;
+                const auto& Pn=mesh.vertices[n];
+                double ox=Pn.x-Pe.x, oy=Pn.y-Pe.y;
+                double r2=ox*ox+oy*oy;
+                if(r2<=0.0) continue;
+                double dot=dx*ox+dy*oy;
+                double co=dot/std::sqrt(L2seg*r2);   // cos(corner angle theta)
+                // THE guard: snap iff it flips the corner's limit state from
+                // failing the bound to meeting it. Each split rule has an
+                // attractor — midpoint dynamics converge to the folded-ratio
+                // wedge; snap dynamics converge to the aligned isoceles wedge
+                // (min angle min(theta,(180-theta)/2)). Compare both against
+                // the bound and snap only when that comparison says it helps.
+                //
+                // (a) The ALIGNED attractor must MEET the bound:
+                //         minAng <= theta <= 180-2*minAng.
+                //     This rejects acute corners (theta<minAng: snapping cannot
+                //     help; shellApex/give-up territory) and near-collinear
+                //     junctions (theta~180: arc-chord chains and every Steiner
+                //     chain vertex), where aligning is meaningless.
+                if(co>cosMinAng) continue;                     // theta < minAng
+                if(co<1.0-2.0*cosMinAng*cosMinAng) continue;   // theta > 180-2*minAng
+                // (b) The MIDPOINT attractor must FAIL the bound: fold the
+                //     midpoint ratio (L/2)/r by octaves into [1/sqrt2, sqrt2)
+                //     — midpoint dynamics preserve this fold — and test the
+                //     invariant wedge (sides 1 and rho at theta). If it meets
+                //     the bound, midpoints are safe here and cost nothing;
+                //     transiently-bad-but-convergent states stay midpoint.
+                {
+                    double rho=0.5*std::sqrt(L2seg/r2);
+                    while(rho<0.70710678118654752) rho*=2.0;
+                    while(rho>=1.4142135623730951) rho*=0.5;
+                    double c2=1.0+rho*rho-2.0*rho*co;
+                    if(c2>0.0){
+                        double c=std::sqrt(c2);
+                        double cosA=(1.0+c2-rho*rho)/(2.0*c);        // opposite rho
+                        double cosB=(rho*rho+c2-1.0)/(2.0*rho*c);    // opposite 1
+                        if(co<=cosMinAng && cosA<=cosMinAng && cosB<=cosMinAng)
+                            continue;   // invariant wedge meets the bound: no snap
+                    }
+                }
+                double f=std::sqrt(r2/L2seg);   // neighbor arm length / this length
+                for(double cand : {0.5*f, f, 2.0*f}){
+                    if(cand<1.0/3.0 || cand>2.0/3.0) continue;
+                    double d=std::fabs(cand-0.5);
+                    if(d<bestD){ bestD=d; t = side ? 1.0-cand : cand; }
+                }
+            }
+        }
+        return t;
+    };
+
+    // Core segment split helper (no PBC synchronization). tFrac in (0,1) forces
+    // the split position (fraction from seg.v0 — used to keep PBC partners
+    // synchronized); tFrac<0 computes the corner-aligned fraction.
+    auto splitSegmentCore=[&](int si, std::vector<int>& outAffected, int hintTri=-1,
+                              double tFrac=-1.0) -> int {
         auto seg=mesh.segments[si]; // copy before modifying
         auto& sa=mesh.vertices[seg.v0]; auto& sb=mesh.vertices[seg.v1];
-        double mx=(sa.x+sb.x)*0.5, my=(sa.y+sb.y)*0.5;
+        double t=(tFrac>0.0 && tFrac<1.0)? tFrac : splitFraction(si);
+        double mx=sa.x+(sb.x-sa.x)*t, my=sa.y+(sb.y-sa.y)*t;
         double midLfs = seg.lfs;
         Point mid{mx,my,(int)mesh.vertices.size(),seg.marker,{},midLfs};
 
@@ -2129,6 +2232,11 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
             if(a0>=0 && acuteApices.count(a0)) shellApex[midIdx]=a0;
             else if(a1>=0 && acuteApices.count(a1)) shellApex[midIdx]=a1;
         }
+        // Maintain the constrained-neighbor adjacency for splitFraction.
+        segAdj.resize(mesh.vertices.size());
+        for(int& nb : segAdj[seg.v0]) if(nb==seg.v1) nb=midIdx;
+        for(int& nb : segAdj[seg.v1]) if(nb==seg.v0) nb=midIdx;
+        segAdj[midIdx]={seg.v0,seg.v1};
         Segment s1{seg.v0,midIdx,seg.marker,seg.lfs,seg.pbc_type,seg.no_split};
         Segment s2{midIdx,seg.v1,seg.marker,seg.lfs,seg.pbc_type,seg.no_split};
         mesh.segments[si]=s1;
@@ -2151,7 +2259,8 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
     // same edge, so splitting one splits the other).
     auto splitSegment=[&](int si, std::vector<int>& outAffected, int hintTri=-1) -> bool {
         auto seg=mesh.segments[si]; // copy — seg may be modified by splitSegmentCore
-        int midIdx=splitSegmentCore(si, outAffected, hintTri);
+        double tUsed=splitFraction(si);
+        int midIdx=splitSegmentCore(si, outAffected, hintTri, tUsed);
         if(midIdx<0) return false;
 
         // Synchronized PBC partner split: if this is a PBC segment, find and
@@ -2166,7 +2275,11 @@ void refineQuality(Mesh& mesh, const Options& opts, int nInputVerts){
                 if(pit!=edgeToSeg.end()){
                     int partnerSi=pit->second;
                     std::vector<int> partnerAffected;
-                    int partnerMid=splitSegmentCore(partnerSi, partnerAffected);
+                    // Split the partner at the SAME parametric position (oriented:
+                    // partner may be stored with endpoints in either order) so the
+                    // periodic boundaries keep matching node positions.
+                    double pt = (mesh.segments[partnerSi].v0==tv0) ? tUsed : 1.0-tUsed;
+                    int partnerMid=splitSegmentCore(partnerSi, partnerAffected, -1, pt);
                     if(partnerMid>=0){
                         // Link the two midpoints as PBC twins
                         mesh.pbc_twin[midIdx]=partnerMid;
