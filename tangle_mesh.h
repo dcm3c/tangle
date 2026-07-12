@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2026 David Meeker
+// Copyright (c) 2026 David Meeker
 
 // tangle_mesh.h — Tangle mesh structures and library API
 #ifndef TANGLE_MESH_H

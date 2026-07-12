@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 David Meeker
+
 ////////////////////////////////////////////////////
 // tangle
 // A 2D Delaunay triangulation tool compatible with Shewchuk's Triangle format.
@@ -5,7 +8,7 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.13
+// Version 0.4.14
 // 12 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 David Meeker
 """
 tangle
 A 2D Delaunay triangulation tool compatible with Shewchuk's Triangle format.
