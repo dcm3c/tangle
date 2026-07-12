@@ -8,7 +8,7 @@ Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
 Version 0.4.13
-05 Jul 2026
+12 Jul 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
