@@ -9,7 +9,7 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.13
+Version 0.4.14
 12 Jul 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
