@@ -7,8 +7,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.12
-03 Jul 2026
+Version 0.4.13
+05 Jul 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -45,6 +45,7 @@ THE SOFTWARE.
 """
 
 import sys
+import os
 import math
 import time
 import bisect
@@ -2654,8 +2655,36 @@ def read_tokens(lines, idx):
     return lines[idx].split(), idx + 1
 
 
+def open_retry(fn, mode='r', must_exist=False):
+    """Open a file, riding out transient locks. On Windows, OneDrive (and
+    antivirus scanners) briefly open just-changed files in synced folders with
+    exclusive access -- typically for well under a second. The lock belongs to
+    the OTHER process, so a short bounded retry is the only remedy: backoff
+    25..400 ms, 8 attempts, ~1.6 s total. With must_exist, a genuinely missing
+    file raises immediately (os.path.exists is an attribute query that
+    succeeds even on a lock-held file), so only plausibly-transient failures
+    pay the wait."""
+    delay = 0.025
+    attempt = 0
+    while True:
+        try:
+            f = open(fn, mode)
+            if attempt:
+                print(f"note: '{fn}' was locked; open succeeded on retry",
+                      file=sys.stderr)
+            return f
+        except OSError:
+            if must_exist and not os.path.exists(fn):
+                raise
+            if attempt >= 7:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, 0.4)
+            attempt += 1
+
+
 def read_node_file(filename):
-    with open(filename, 'r') as f:
+    with open_retry(filename, 'r', must_exist=True) as f:
         lines = f.readlines()
     idx = 0
     tokens, idx = read_tokens(lines, idx)
@@ -2674,7 +2703,7 @@ def read_node_file(filename):
 
 
 def read_poly_file(filename):
-    with open(filename, 'r') as f:
+    with open_retry(filename, 'r', must_exist=True) as f:
         lines = f.readlines()
     idx = 0
     tokens, idx = read_tokens(lines, idx)
@@ -2815,7 +2844,7 @@ def read_poly_file(filename):
 
 def write_node_file(fn, pts, n_attribs, has_markers, opts):
     has_lfs = any(p.lfs > 0 for p in pts)
-    with open(fn, 'w') as f:
+    with open_retry(fn, 'w') as f:
         f.write(f"{len(pts)} 2 {n_attribs} {1 if has_markers else 0}\n")
         for i, pt in enumerate(pts):
             out_idx = i if opts.zero_indexed else i + 1
@@ -2830,7 +2859,7 @@ def write_node_file(fn, pts, n_attribs, has_markers, opts):
 
 
 def write_ele_file(fn, mesh, has_attrib, opts):
-    with open(fn, 'w') as f:
+    with open_retry(fn, 'w') as f:
         f.write(f"{len(mesh.triangles)} 3 {1 if has_attrib else 0}\n")
         for i, t in enumerate(mesh.triangles):
             out_idx = i if opts.zero_indexed else i + 1
@@ -2843,7 +2872,7 @@ def write_ele_file(fn, mesh, has_attrib, opts):
 
 
 def write_edge_file(fn, mesh, opts):
-    with open(fn, 'w') as f:
+    with open_retry(fn, 'w') as f:
         edge_count = {}
         for t in mesh.triangles:
             if t.v[0] < 0:
@@ -2872,7 +2901,7 @@ def write_edge_file(fn, mesh, opts):
 
 
 def write_neigh_file(fn, mesh, opts):
-    with open(fn, 'w') as f:
+    with open_retry(fn, 'w') as f:
         f.write(f"{len(mesh.triangles)} 3\n")
         off = 0 if opts.zero_indexed else 1
         for i, t in enumerate(mesh.triangles):
@@ -2886,7 +2915,7 @@ def write_neigh_file(fn, mesh, opts):
 
 def write_poly_file(fn, mesh, opts):
     has_seg_lfs = any(s.lfs > 0 for s in mesh.segments)
-    with open(fn, 'w') as f:
+    with open_retry(fn, 'w') as f:
         # Vertex count 0: the .poly references the companion .node file for its
         # nodes (Shewchuk's Triangle convention) instead of duplicating them.
         # Segment endpoints below index into the .node file.
@@ -2903,7 +2932,7 @@ def write_poly_file(fn, mesh, opts):
 
 
 def write_pbc_file(fn, mesh, opts):
-    with open(fn, 'w') as f:
+    with open_retry(fn, 'w') as f:
         f.write(f"{len(mesh.pbc_pairs)}\n")
         for i, p in enumerate(mesh.pbc_pairs):
             f.write(f"{i}\t{p.node_a}\t{p.node_b}\t{p.type}\n")
