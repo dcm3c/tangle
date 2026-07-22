@@ -206,8 +206,10 @@ to map unbounded exterior domains onto a finite mesh.
 
 When given a `.fem`, `.fee`, `.feh`, or `.fec` file, tangle reads the FEMM
 problem definition directly: node coordinates, line segments, arc segments
-(with automatic chord discretization), block labels (mapped to regions with
-area constraints), hole points (`<No Mesh>` blocks), and boundary properties.
+(with automatic chord discretization), block labels (each mapped to a region
+with its area constraint — including labels with no material assigned, which
+are meshed like any other and left to the application to interpret), hole
+points, and boundary properties.
 SmartMesh and per-segment `MaxSideLength` constraints are translated to LFS
 values. PBC and AGE boundary types are detected from `BdryFormat` codes and
 handled automatically.

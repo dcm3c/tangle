@@ -8,8 +8,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.14
-// 12 Jul 2026
+// Version 0.4.15
+// 22 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -3577,14 +3577,18 @@ bool readFemFile(const std::string& filename,
             continue;
         }
 
-        // Read block labels -> regions (skip <No Mesh> blocks, which become holes)
-        // blockType in .fem is 1-based material index; 0 = <No Mesh>.
-        // Region attributes use k+1 numbering that skips <No Mesh> blocks,
-        // matching writepoly.cpp so the solver indexes labellist[] correctly.
+        // Read block labels -> regions. Each block label seeds a region tagged
+        // r.attrib = k+1 (k = its position in this list), so the solver's
+        // region_attrib-1 indexes labellist[]. A label with no material assigned
+        // ("<None>", written to the .fem as index 0) is meshed like any other, so
+        // the mesh button fills the region instead of leaving a gap; the mesh
+        // display greys it via a block-label lookup, and the solver rejects <None>
+        // before solving. Real holes come only from the [NumHoles] section, never
+        // from a block label.
         if(iPrefix(trimmed,"[numblocklabels]")){
             std::istringstream ss(stripKey(trimmed));
             int n; ss>>n;
-            int k=0; // counter for non-<No Mesh> blocks
+            int k=0; // block-label counter -> k+1 region attributes
             for(int i=0;i<n;i++){
                 if(!std::getline(f,line)) break;
                 double v[9]; int got=parseNums(line,v,9);
@@ -3599,15 +3603,10 @@ bool readFemFile(const std::string& filename,
                 if(got>6) group=(int)v[6];
                 if(got>7) turns=(int)v[7];
                 if(got>8) isExt=(int)v[8];
-                (void)circIdx; (void)magDir; (void)turns; (void)group;
-                if(blockType==0){
-                    // <No Mesh> block → add as hole seed point
-                    holes.push_back({x,y});
-                    continue;
-                }
+                (void)blockType; (void)circIdx; (void)magDir; (void)turns; (void)group;
                 Region r;
                 r.x=x; r.y=y;
-                r.attrib=(double)(k+1); // k+1 encoding, skipping <No Mesh> blocks
+                r.attrib=(double)(k+1); // block label number; solver maps back via labellist[]
                 if(diam>0) r.max_area = M_PI*diam*diam/4.0;
                 else r.max_area = -1.0;
                 regions.push_back(r);
