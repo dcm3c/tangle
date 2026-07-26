@@ -3178,11 +3178,39 @@ def build_pbc_twin_from_cdt(mesh):
 
         sl1 = extract_chain()
         sl2 = extract_chain()
-        if not sl1 or not sl2:
+        if not sl1:
             continue
 
-        chain1 = build_directed_chain(sl1)
-        chain2 = build_directed_chain(sl2)
+        if sl2:
+            chain1 = build_directed_chain(sl1)
+            chain2 = build_directed_chain(sl2)
+        else:
+            # The two sides of this boundary ADJOIN: they share an endpoint
+            # (e.g. an anti-periodic line straight through the model center,
+            # declared as two segments on one boundary marker), so connectivity
+            # finds a single chain. Split the directed node chain at the node
+            # sitting at half the total arc length; the shared node lands in
+            # both chains and becomes its own twin — for an anti-periodic
+            # boundary that imposes A = -A, i.e. A = 0 there, exactly the pair
+            # original FEMM's writepoly.cpp emits for this layout.
+            full = build_directed_chain(sl1)
+            if len(full) < 3:
+                continue
+            cum = [0.0]
+            for ci in range(1, len(full)):
+                p0 = mesh.vertices[full[ci-1]]
+                p1 = mesh.vertices[full[ci]]
+                cum.append(cum[-1] + math.hypot(p1.x-p0.x, p1.y-p0.y))
+            total = cum[-1]
+            mid, best = 0, float('inf')
+            for ci in range(1, len(full)-1):
+                d = abs(cum[ci] - 0.5*total)
+                if d < best:
+                    best, mid = d, ci
+            if mid == 0 or best > 1e-6*total:
+                continue   # no halfway node: sides not congruent
+            chain1 = full[:mid+1]
+            chain2 = full[mid:]
         if not chain1 or not chain2:
             continue
         if len(chain1) != len(chain2):
@@ -3246,8 +3274,11 @@ def build_pbc_twin_from_cdt(mesh):
                 chain2 = list(reversed(chain2))
             for i in range(len(chain1)):
                 a, b = chain1[i], chain2[i]
-                if a == b:
-                    continue
+                # a==b happens when the two sides of a boundary adjoin: the
+                # shared node is its own twin. Record it -- the refinement
+                # partner-split lookup needs the entry, and the pair reaches
+                # the .pbc output (anti-periodic: A = -A pins A = 0 there,
+                # matching original FEMM).
                 mesh.pbc_twin[a] = b
                 mesh.pbc_twin[b] = a
                 mesh.pbc_node_type[a] = pbc_type
@@ -3486,8 +3517,9 @@ def main():
     # Convert PBC twin map to output pairs
     seen_pbc = set()
     for a, b in mesh.pbc_twin.items():
-        if a == b:
-            continue
+        # Self-pairs (a==b) are kept: a node shared by both sides of an
+        # adjoining boundary is its own twin, and original FEMM emits the
+        # pair so the solver constrains it (anti-periodic -> A=0).
         key = (min(a, b), max(a, b))
         if key not in seen_pbc:
             seen_pbc.add(key)

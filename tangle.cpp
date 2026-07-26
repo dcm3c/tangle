@@ -8,8 +8,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.15
-// 22 Jul 2026
+// Version 0.4.16
+// 26 Jul 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -2862,9 +2862,43 @@ void buildPbcTwinFromCDT(Mesh& mesh){
             return chain;
         };
         auto sl1=extractChain(), sl2=extractChain();
-        if(sl1.empty()||sl2.empty()) continue;
+        if(sl1.empty()) continue;
 
-        auto chain1=buildDirectedChain(sl1), chain2=buildDirectedChain(sl2);
+        std::vector<int> chain1, chain2;
+        if(!sl2.empty()){
+            chain1=buildDirectedChain(sl1);
+            chain2=buildDirectedChain(sl2);
+        } else {
+            // The two sides of this boundary ADJOIN: they share an endpoint
+            // (e.g. an anti-periodic line straight through the model center,
+            // declared as two segments on one boundary property), so
+            // connectivity finds a single chain and the two-chain split above
+            // comes up empty. The pairing is still well defined: the sides are
+            // the two congruent halves of the chain, meeting at the shared
+            // input vertex. Split the directed node chain at the node sitting
+            // at half the total arc length; the shared node lands in both
+            // chains and becomes its own twin — for an anti-periodic boundary
+            // that imposes A = -A, i.e. A = 0 at the shared node, exactly the
+            // pair original FEMM's writepoly.cpp emits for this layout.
+            auto full=buildDirectedChain(sl1);
+            if(full.size()<3) continue;
+            double total=0;
+            std::vector<double> cum(full.size(), 0.0);
+            for(size_t ci=1;ci<full.size();ci++){
+                const auto& p0=mesh.vertices[full[ci-1]];
+                const auto& p1=mesh.vertices[full[ci]];
+                total+=std::sqrt((p1.x-p0.x)*(p1.x-p0.x)+(p1.y-p0.y)*(p1.y-p0.y));
+                cum[ci]=total;
+            }
+            size_t mid=0; double best=1e300;
+            for(size_t ci=1;ci+1<full.size();ci++){
+                double d=std::fabs(cum[ci]-0.5*total);
+                if(d<best){ best=d; mid=ci; }
+            }
+            if(mid==0 || best>1e-6*total) continue; // no halfway node: sides not congruent
+            chain1.assign(full.begin(), full.begin()+mid+1);
+            chain2.assign(full.begin()+mid, full.end());
+        }
         if(chain1.empty()||chain2.empty()) continue;
         if(chain1.size()!=chain2.size()) continue;
 
@@ -2955,7 +2989,11 @@ void buildPbcTwinFromCDT(Mesh& mesh){
 
             for(int i=0;i<(int)c1.size();i++){
                 int a=c1[i], b=c2[i];
-                if(a==b) continue;
+                // a==b happens when the two sides of a boundary adjoin: the
+                // shared node is its own twin. Record it — the refinement
+                // partner-split lookup needs the entry, and the pair reaches
+                // the .pbc output (anti-periodic: A = -A pins A = 0 there,
+                // matching original FEMM).
                 mesh.pbc_twin[a]=b; mesh.pbc_twin[b]=a;
                 mesh.pbc_node_type[a]=bp.pbcType;
                 mesh.pbc_node_type[b]=bp.pbcType;
@@ -4828,7 +4866,9 @@ static int runMeshPipeline(Mesh& mesh, const Options& opts)
     {
         std::set<std::pair<int,int>> seen;
         for(auto& [a, b] : mesh.pbc_twin){
-            if(a==b) continue;
+            // Self-pairs (a==b) are kept: a node shared by both sides of an
+            // adjoining boundary is its own twin, and original FEMM emits the
+            // pair so the solver constrains it (anti-periodic -> A=0).
             auto key=std::make_pair(std::min(a,b), std::max(a,b));
             if(seen.insert(key).second){
                 int type=mesh.pbc_node_type.count(a)?mesh.pbc_node_type[a]:0;
