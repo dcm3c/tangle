@@ -136,6 +136,7 @@ class Segment:
     lfs: float = -1.0  # per-segment LFS constraint (-1 = none)
     pbc_type: int = -1     # 0=periodic, 1=anti-periodic (-1 = none)
     no_split: bool = False # true for AGE chord segments (must stay uniformly spaced)
+    pbc_side: int = -1     # 0/1: declared side of an (anti)periodic pair; -1 = n/a
 
 
 @dataclass
@@ -533,8 +534,8 @@ def clean_pslg(mesh, tol, quiet):
                     best_i = i
             if best_i >= 0:
                 # Point best_i is on segment si — split it
-                s2 = Segment(best_i, segs[si].v1, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
-                segs[si] = Segment(segs[si].v0, best_i, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split)
+                s2 = Segment(best_i, segs[si].v1, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split, segs[si].pbc_side)
+                segs[si] = Segment(segs[si].v0, best_i, segs[si].marker, segs[si].lfs, segs[si].pbc_type, segs[si].no_split, segs[si].pbc_side)
                 segs.append(s2)
                 split_segs += 1
                 changed = True
@@ -614,11 +615,11 @@ def clean_pslg(mesh, tol, quiet):
                     near_node = len(pts)
                     pts.append(Point(ix, iy, near_node, 0))
                 # Split both segments
-                s_i2 = Segment(near_node, segs[i].v1, segs[i].marker, segs[i].lfs, segs[i].pbc_type, segs[i].no_split)
-                segs[i] = Segment(segs[i].v0, near_node, segs[i].marker, segs[i].lfs, segs[i].pbc_type, segs[i].no_split)
+                s_i2 = Segment(near_node, segs[i].v1, segs[i].marker, segs[i].lfs, segs[i].pbc_type, segs[i].no_split, segs[i].pbc_side)
+                segs[i] = Segment(segs[i].v0, near_node, segs[i].marker, segs[i].lfs, segs[i].pbc_type, segs[i].no_split, segs[i].pbc_side)
                 segs.append(s_i2)
-                s_j2 = Segment(near_node, segs[j].v1, segs[j].marker, segs[j].lfs, segs[j].pbc_type, segs[j].no_split)
-                segs[j] = Segment(segs[j].v0, near_node, segs[j].marker, segs[j].lfs, segs[j].pbc_type, segs[j].no_split)
+                s_j2 = Segment(near_node, segs[j].v1, segs[j].marker, segs[j].lfs, segs[j].pbc_type, segs[j].no_split, segs[j].pbc_side)
+                segs[j] = Segment(segs[j].v0, near_node, segs[j].marker, segs[j].lfs, segs[j].pbc_type, segs[j].no_split, segs[j].pbc_side)
                 segs.append(s_j2)
                 split_segs += 2
                 changed = True
@@ -1120,9 +1121,9 @@ def enforce_constraints(mesh, quiet):
             on_seg.sort()
             prev_v = su
             for _, vi in on_seg:
-                new_segs.append(Segment(prev_v, vi, seg.marker, seg.lfs, seg.pbc_type, seg.no_split))
+                new_segs.append(Segment(prev_v, vi, seg.marker, seg.lfs, seg.pbc_type, seg.no_split, seg.pbc_side))
                 prev_v = vi
-            new_segs.append(Segment(prev_v, sv, seg.marker, seg.lfs, seg.pbc_type, seg.no_split))
+            new_segs.append(Segment(prev_v, sv, seg.marker, seg.lfs, seg.pbc_type, seg.no_split, seg.pbc_side))
     if len(new_segs) != len(mesh.segments):
         if not quiet:
             print(f"  Split {len(mesh.segments)} segments into {len(new_segs)} sub-segments (collinear vertices)",
@@ -2272,7 +2273,8 @@ def refine_quality(mesh, opts, n_input_verts):
         partner sync). Returns split-point index or -1 on failure."""
         seg = Segment(mesh.segments[si].v0, mesh.segments[si].v1,
                       mesh.segments[si].marker, mesh.segments[si].lfs,
-                      mesh.segments[si].pbc_type, mesh.segments[si].no_split)
+                      mesh.segments[si].pbc_type, mesh.segments[si].no_split,
+                      mesh.segments[si].pbc_side)
         sa, sb = mesh.vertices[seg.v0], mesh.vertices[seg.v1]
         t = t_frac if 0.0 < t_frac < 1.0 else split_fraction(si)
         mx, my = sa.x + (sb.x - sa.x) * t, sa.y + (sb.y - sa.y) * t
@@ -2305,8 +2307,8 @@ def refine_quality(mesh, opts, n_input_verts):
         seg_adj[seg.v0] = [mid_idx if nb == seg.v1 else nb for nb in seg_adj[seg.v0]]
         seg_adj[seg.v1] = [mid_idx if nb == seg.v0 else nb for nb in seg_adj[seg.v1]]
         seg_adj[mid_idx] = [seg.v0, seg.v1]
-        s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_type, seg.no_split)
-        s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_type, seg.no_split)
+        s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_type, seg.no_split, seg.pbc_side)
+        s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_type, seg.no_split, seg.pbc_side)
         mesh.segments[si] = s1
         new_si = len(mesh.segments)
         mesh.segments.append(s2)
@@ -2764,13 +2766,17 @@ def read_poly_file(filename):
 
     # ---- tangle extensions: arcs and PBCs (optional, after regions) ----
 
-    # Arc segments
+    # Arc segments. poly_arcs records each arc's chord-segment range so a
+    # same-marker PBC declaration can identify its two sides by SOURCE ARC.
+    poly_arcs = []          # (first_seg, n_segs, marker)
+    n_plain_segs = len(segs)
     tokens, idx = read_tokens(lines, idx)
     if tokens:
         n_arcs = int(tokens[0])
         arc_has_markers = int(tokens[1]) if len(tokens) > 1 else 0
         for _ in range(n_arcs):
             tokens, idx = read_tokens(lines, idx)
+            arc_first = len(segs)
             v0_raw, v1_raw = int(tokens[1]), int(tokens[2])
             v0a, v1a = v0_raw - base, v1_raw - base
             angle = float(tokens[3])
@@ -2795,6 +2801,7 @@ def read_poly_file(filename):
             d = math.sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay))
             if d < 1e-30:
                 segs.append(Segment(v0a, v1a, arc_marker, arc_lfs))
+                poly_arcs.append((arc_first, 1, arc_marker))
                 continue
 
             tta = angle * math.pi / 180.0
@@ -2824,6 +2831,7 @@ def read_poly_file(filename):
                         prev_idx = new_idx
                     else:
                         segs.append(Segment(prev_idx, v1a, arc_marker, arc_lfs))
+            poly_arcs.append((arc_first, len(segs) - arc_first, arc_marker))
 
     # PBC definitions: pair two boundary markers
     pbc_defs = []
@@ -2834,11 +2842,43 @@ def read_poly_file(filename):
             tokens, idx = read_tokens(lines, idx)
             marker_a, marker_b = int(tokens[1]), int(tokens[2])
             pbc_type = int(tokens[3])
-            for s in segs:
-                if s.marker == marker_a or s.marker == marker_b:
-                    s.pbc_type = pbc_type
-            # Record the declaration: build_pbc_twin_from_cdt needs to know
-            # WHICH markers pair when the two chains carry different ones.
+            # Tag every segment of the pair with its type AND its side. Sides
+            # are DECLARED here, never inferred from connectivity later
+            # (connectivity cannot tell two adjoining sides apart).
+            if marker_a != marker_b:
+                # Cross-marker form: the marker IS the side.
+                for s in segs:
+                    if s.marker == marker_a:
+                        s.pbc_type = pbc_type; s.pbc_side = 0
+                    elif s.marker == marker_b:
+                        s.pbc_type = pbc_type; s.pbc_side = 1
+            else:
+                # Same-marker form (FEMM-style): the marker must identify
+                # exactly two entities -- two plain segments, or two arcs (each
+                # arc's chord range is one side). Anything else is ambiguous,
+                # mirroring original FEMM's "more than two segments" error.
+                plain = [si for si in range(n_plain_segs)
+                         if segs[si].marker == marker_a]
+                arc_idx = [ai for ai, a in enumerate(poly_arcs)
+                           if a[2] == marker_a]
+                if len(plain) == 2 and not arc_idx:
+                    segs[plain[0]].pbc_type = pbc_type; segs[plain[0]].pbc_side = 0
+                    segs[plain[1]].pbc_type = pbc_type; segs[plain[1]].pbc_side = 1
+                elif (len(arc_idx) == 2 and not plain
+                      and poly_arcs[arc_idx[0]][1] == poly_arcs[arc_idx[1]][1]):
+                    for side in range(2):
+                        first, cnt, _m = poly_arcs[arc_idx[side]]
+                        for k2 in range(cnt):
+                            segs[first + k2].pbc_type = pbc_type
+                            segs[first + k2].pbc_side = side
+                else:
+                    raise ValueError(
+                        f"PBC declaration (marker {marker_a}, type {pbc_type}) "
+                        f"must name exactly two segments or two equal-count arcs "
+                        f"when both markers are the same; found {len(plain)} "
+                        f"segment(s) and {len(arc_idx)} arc(s). Use two distinct "
+                        f"markers, one per side, for chain boundaries.")
+            # Record the declaration for build_pbc_twin_from_cdt.
             pbc_defs.append((marker_a, marker_b, pbc_type))
 
     return pts, segs, holes, regions, n_attribs, pbc_defs
@@ -3149,71 +3189,37 @@ def build_pbc_twin_from_cdt(mesh):
     for marker, pbc_type in pbc_boundaries:
         if marker in cross_markers:
             continue
-        all_segs = [si for si, s in enumerate(mesh.segments)
-                    if s.marker == marker and s.pbc_type == pbc_type]
-
-        # BFS split into two connected chains
-        remaining = set(all_segs)
-        def extract_chain():
-            if not remaining:
-                return []
-            chain = []
-            adj = {}
-            for si in remaining:
-                adj.setdefault(mesh.segments[si].v0, []).append(si)
-                adj.setdefault(mesh.segments[si].v1, []).append(si)
-            first = next(iter(remaining))
-            q = [first]
-            remaining.discard(first)
-            chain.append(first)
-            while q:
-                si = q.pop(0)
-                for nd in (mesh.segments[si].v0, mesh.segments[si].v1):
-                    for ni in adj.get(nd, []):
-                        if ni in remaining:
-                            remaining.discard(ni)
-                            chain.append(ni)
-                            q.append(ni)
-            return chain
-
-        sl1 = extract_chain()
-        sl2 = extract_chain()
-        if not sl1:
-            continue
-
-        if sl2:
-            chain1 = build_directed_chain(sl1)
-            chain2 = build_directed_chain(sl2)
-        else:
-            # The two sides of this boundary ADJOIN: they share an endpoint
-            # (e.g. an anti-periodic line straight through the model center,
-            # declared as two segments on one boundary marker), so connectivity
-            # finds a single chain. Split the directed node chain at the node
-            # sitting at half the total arc length; the shared node lands in
-            # both chains and becomes its own twin — for an anti-periodic
-            # boundary that imposes A = -A, i.e. A = 0 there, exactly the pair
-            # original FEMM's writepoly.cpp emits for this layout.
-            full = build_directed_chain(sl1)
-            if len(full) < 3:
+        # Partition the group by its DECLARED side (reader-assigned pbc_side).
+        # Sides are never inferred from connectivity -- connectivity cannot
+        # tell two adjoining sides apart (an anti-periodic line straight
+        # through the model center is one connected chain), which used to
+        # punt silently.
+        sl1, sl2, untagged = [], [], 0
+        for si, sg in enumerate(mesh.segments):
+            if sg.marker != marker or sg.pbc_type != pbc_type:
                 continue
-            cum = [0.0]
-            for ci in range(1, len(full)):
-                p0 = mesh.vertices[full[ci-1]]
-                p1 = mesh.vertices[full[ci]]
-                cum.append(cum[-1] + math.hypot(p1.x-p0.x, p1.y-p0.y))
-            total = cum[-1]
-            mid, best = 0, float('inf')
-            for ci in range(1, len(full)-1):
-                d = abs(cum[ci] - 0.5*total)
-                if d < best:
-                    best, mid = d, ci
-            if mid == 0 or best > 1e-6*total:
-                continue   # no halfway node: sides not congruent
-            chain1 = full[:mid+1]
-            chain2 = full[mid:]
-        if not chain1 or not chain2:
+            if sg.pbc_side == 0:
+                sl1.append(si)
+            elif sg.pbc_side == 1:
+                sl2.append(si)
+            else:
+                untagged += 1
+        if untagged:
+            print(f"Warning: PBC boundary (marker {marker}) has {untagged} "
+                  f"segment(s) without a declared side; pairing skipped.",
+                  file=sys.stderr)
             continue
-        if len(chain1) != len(chain2):
+        if not sl1 or not sl2:
+            print(f"Warning: PBC boundary (marker {marker}) is missing one "
+                  f"side; pairing skipped.", file=sys.stderr)
+            continue
+
+        chain1 = build_directed_chain(sl1)
+        chain2 = build_directed_chain(sl2)
+        if not chain1 or not chain2 or len(chain1) != len(chain2):
+            print(f"Warning: PBC boundary (marker {marker}) sides have "
+                  f"{len(chain1)} vs {len(chain2)} nodes; pairing skipped.",
+                  file=sys.stderr)
             continue
         bdry_pairs.append((chain1, chain2, pbc_type, False))
 
@@ -3441,9 +3447,9 @@ def main():
                 mid_idx = len(mesh.vertices)
                 mesh.vertices.append(Point(mx, my, mid_idx, bm, []))
                 v0, v1, mk = seg.v0, seg.v1, seg.marker
-                slfs, spt = seg.lfs, seg.pbc_type
-                mesh.segments[si] = Segment(v0, mid_idx, mk, slfs, spt)
-                mesh.segments.insert(si + 1, Segment(mid_idx, v1, mk, slfs, spt))
+                slfs, spt, sps = seg.lfs, seg.pbc_type, seg.pbc_side
+                mesh.segments[si] = Segment(v0, mid_idx, mk, slfs, spt, False, sps)
+                mesh.segments.insert(si + 1, Segment(mid_idx, v1, mk, slfs, spt, False, sps))
 
             if not opts.quiet:
                 print(f"  Split {len(to_split)} unenforced segments, rebuilding...",
