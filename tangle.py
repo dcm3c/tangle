@@ -3363,6 +3363,15 @@ def main():
         print(f"Error parsing {input_file}: {e}", file=sys.stderr)
         return TANGLE_ERR_PARSE
 
+    # A triangulation needs at least three points. Reject degenerate input up
+    # front rather than limping through the pipeline: with nothing to mesh, the
+    # later stages (jettison, node reordering) index into empty lists.
+    if len(mesh.vertices) < 3:
+        print(f"Error: nothing to mesh - the input has {len(mesh.vertices)} "
+              f"point(s); at least 3 are needed to form a triangle.",
+              file=sys.stderr)
+        return TANGLE_ERR_MESH
+
     # Shift coordinates to near the origin to maximize floating-point precision.
     shift_x, shift_y = 0.0, 0.0
     if mesh.vertices:
@@ -3519,6 +3528,15 @@ def main():
         extract_edges(mesh)
     if not opts.quiet:
         print(f"  Cleanup+edges: {elapsed():.1f} ms", file=sys.stderr)
+
+    # No triangles survived: the input encloses no area (all points collinear or
+    # coincident, every region flooded away as a hole, ...). An empty mesh is
+    # useless to a solver, so stop with a diagnosis instead of writing one.
+    if not mesh.triangles:
+        print("Error: no mesh was generated - the input encloses no area.\n"
+              "Check for points that are all collinear or coincident, or for\n"
+              "boundary segments that do not enclose a region.", file=sys.stderr)
+        return TANGLE_ERR_MESH
 
     # Convert PBC twin map to output pairs
     seen_pbc = set()
