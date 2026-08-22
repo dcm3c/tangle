@@ -5273,6 +5273,12 @@ int main(int argc, char* argv[]){
 
 int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
 {
+    // Clear the caller's mesh up front: on any failure return below it then
+    // stays empty rather than retaining whatever it held before. A caller that
+    // reuses one Mesh across calls (and does not check the return code) would
+    // otherwise be left holding the PREVIOUS model's mesh, which looks valid.
+    outMesh = Mesh{};
+
     std::string inputFile = inputBase;
     std::string ext;
 
