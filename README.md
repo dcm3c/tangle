@@ -1,6 +1,6 @@
 # tangle
 
-**Version 0.4.17** — 26 Jul 2026
+**Version 0.4.18** — 22 Aug 2026
 
 A 2D constrained Delaunay triangulation and quality mesh generation tool,
 implemented in C++17. File format compatible with Shewchuk's
@@ -102,7 +102,7 @@ missing file from a bad file from a genuine meshing failure:
 | 1    | usage error (no arguments / no input file named) |
 | 2    | input file not found or could not be opened |
 | 3    | input file opened but could not be parsed |
-| 4    | meshing failed (a segment could not be enforced) |
+| 4    | meshing failed (a segment could not be enforced, or the input encloses no area) |
 | 5    | option not valid for this input (e.g. `-g` on a non-FEMM file) |
 
 ### Example
