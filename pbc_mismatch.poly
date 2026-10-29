@@ -1,0 +1,19 @@
+# pbc_mismatch.poly - MUST FAIL (exit 4): periodic radials whose two sides have different segment counts (marker 11 side has a midpoint node), so the chains cannot be paired. Guards the loud-failure check that replaced a silent natural boundary.
+5  2  0  1
+1   1.0        0.0        10
+2   3.0        0.0        10
+3   0.70710678 0.70710678 11
+4   2.12132034 2.12132034 11
+5   1.41421356 1.41421356 11
+3  1
+1   1   2   10
+2   3   5   11
+3   5   4   11
+0
+1
+1   1.5  0.3  1  0.1
+2  1
+1   2   4   45.0   10.0   0
+2   1   3   45.0   10.0   0
+1
+1   10   11   0

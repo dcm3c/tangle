@@ -1,0 +1,107 @@
+[Format]      =  1
+[Frequency]   =  0
+[Precision]   =  1e-08
+[MinAngle]    =  30
+[DoSmartMesh] =  1
+[Depth]       =  100
+[LengthUnits] =  centimeters
+[ProblemType] =  planar
+[Coordinates] =  cartesian
+[Comment]     =  ""
+[ACSolver]    =  0
+[dT]          =  0
+[PrevSoln]    =  ""
+[PointProps]   = 0
+[BdryProps]   = 6
+  <BeginBdry>
+    <BdryName> = "Rad"
+    <BdryType> = 3
+    <Tset> = 0
+    <qs> = 0
+    <Tinf> = 0
+    <h> = 0
+    <beta> = 0.94999999999999996
+    <TinfRad> = 273
+  <EndBdry>
+  <BeginBdry>
+    <BdryName> = "Per"
+    <BdryType> = 4
+    <Tset> = 0
+    <qs> = 0
+    <Tinf> = 0
+    <h> = 0
+    <beta> = 0
+    <TinfRad> = 0
+  <EndBdry>
+  <BeginBdry>
+    <BdryName> = "Anti"
+    <BdryType> = 5
+    <Tset> = 0
+    <qs> = 0
+    <Tinf> = 0
+    <h> = 0
+    <beta> = 0
+    <TinfRad> = 0
+  <EndBdry>
+  <BeginBdry>
+    <BdryName> = "Hot"
+    <BdryType> = 0
+    <Tset> = 400
+    <qs> = 0
+    <Tinf> = 0
+    <h> = 0
+    <beta> = 0
+    <TinfRad> = 0
+  <EndBdry>
+  <BeginBdry>
+    <BdryName> = "Cold"
+    <BdryType> = 0
+    <Tset> = 300
+    <qs> = 0
+    <Tinf> = 0
+    <h> = 0
+    <beta> = 0
+    <TinfRad> = 0
+  <EndBdry>
+  <BeginBdry>
+    <BdryName> = "Fix"
+    <BdryType> = 0
+    <Tset> = 300
+    <qs> = 0
+    <Tinf> = 0
+    <h> = 0
+    <beta> = 0
+    <TinfRad> = 0
+  <EndBdry>
+[BlockProps]  = 2
+  <BeginBlock>
+    <BlockName> = "Gen"
+    <Kx> = 200
+    <Ky> = 200
+    <Kt> = 3
+    <qv> = 100000
+    <TKPoints> = 0
+  <EndBlock>
+  <BeginBlock>
+    <BlockName> = "NoGen"
+    <Kx> = 200
+    <Ky> = 200
+    <Kt> = 3
+    <qv> = 0
+    <TKPoints> = 0
+  <EndBlock>
+[ConductorProps]  = 0
+[NumPoints] = 4
+-10	-1	0	0	0	-1
+10	-1	0	0	0	-1
+10	1	0	0	0	-1
+-10	1	0	0	0	-1
+[NumSegments] = 4
+0	1	-1	2	0	0	0
+1	2	-1	5	0	0	0
+2	3	-1	2	0	0	0
+3	0	-1	4	0	0	0
+[NumArcSegments] = 0
+[NumHoles] = 0
+[NumBlockLabels] = 1
+0	0	2	-1	0	0
