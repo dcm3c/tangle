@@ -8,8 +8,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.19
-// 28 Oct 2026
+// Version 0.4.20
+// 29 Oct 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -3175,6 +3175,17 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
         s.skipComments();
         int idx=0; s.nextInt(idx); s.nextInt(segs[i].v0); s.nextInt(segs[i].v1);
         segs[i].v0-=base; segs[i].v1-=base;
+        // An endpoint outside the vertex list would index pts[] out of range
+        // from here on (undefined behavior: the arc chordizer read past the
+        // array). Refuse it, naming the vertex in the file's own numbering.
+        for(int v : {segs[i].v0, segs[i].v1}){
+            if(v<0 || v>=(int)pts.size()){
+                std::cerr<<"Error: segment "<<idx<<" references vertex "<<v+base
+                         <<" but the file has "<<pts.size()<<" vertices (numbered from "
+                         <<base<<")\n";
+                return false;
+            }
+        }
         if(smark>0) s.nextInt(segs[i].marker); else segs[i].marker=0;
         // Optional LFS column after marker
         double lval;
@@ -3222,6 +3233,14 @@ bool readPolyFile(const std::string& filename, Mesh& mesh, int& nAttribs){
                 s.nextInt(idx); s.nextInt(v0); s.nextInt(v1);
                 s.nextDouble(angle); s.nextDouble(maxSegAngle);
                 v0-=base; v1-=base;
+                for(int v : {v0, v1}){
+                    if(v<0 || v>=(int)pts.size()){
+                        std::cerr<<"Error: arc "<<idx<<" references vertex "<<v+base
+                                 <<" but the file has "<<pts.size()<<" vertices (numbered from "
+                                 <<base<<")\n";
+                        return false;
+                    }
+                }
                 int marker=0;
                 if(arcHasMarkers) s.nextInt(marker);
                 // Optional LFS after marker
@@ -3717,6 +3736,29 @@ bool readFemFile(const std::string& filename,
                 k++;
             }
             continue;
+        }
+    }
+
+    // ----- Validate segment / arc endpoints -----
+    // Sections can arrive in any order, so this runs once parsing is complete.
+    // An endpoint outside [NumPoints] would index pts[] out of range in every
+    // stage below (undefined behavior); refuse the file instead.
+    for(int i=0;i<(int)femSegs.size();i++){
+        for(int v : {femSegs[i].n0, femSegs[i].n1}){
+            if(v<0 || v>=(int)pts.size()){
+                std::cerr<<"Error: segment "<<i<<" references point "<<v
+                         <<" but [NumPoints] = "<<pts.size()<<"\n";
+                return false;
+            }
+        }
+    }
+    for(int i=0;i<(int)arcs.size();i++){
+        for(int v : {arcs[i].n0, arcs[i].n1}){
+            if(v<0 || v>=(int)pts.size()){
+                std::cerr<<"Error: arc segment "<<i<<" references point "<<v
+                         <<" but [NumPoints] = "<<pts.size()<<"\n";
+                return false;
+            }
         }
     }
 

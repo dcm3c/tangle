@@ -1,0 +1,16 @@
+# badarc_idx.poly - arc 1 names vertices 10,11 in a 4-vertex file. Must be refused (exit 3);
+# before this fix it read past the vertex array (segfault or runaway memory).
+4 2 0 1
+1 0 0 1
+2 2 0 1
+3 2 2 2
+4 0 2 2
+4 1
+1 1 2 1
+2 2 3 2
+3 3 4 3
+4 4 1 4
+0
+0
+1 1
+1 10 11 90 1 0
