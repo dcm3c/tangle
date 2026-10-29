@@ -1,6 +1,6 @@
 # tangle
 
-**Version 0.4.18** — 22 Aug 2026
+**Version 0.4.20** — 29 Oct 2026
 
 A 2D constrained Delaunay triangulation and quality mesh generation tool,
 implemented in C++17. File format compatible with Shewchuk's
