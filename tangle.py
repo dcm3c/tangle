@@ -9,8 +9,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.18
-22 Aug 2026
+Version 0.4.20
+29 Oct 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
@@ -137,6 +137,14 @@ class Segment:
     pbc_type: int = -1     # 0=periodic, 1=anti-periodic (-1 = none)
     no_split: bool = False # true for AGE chord segments (must stay uniformly spaced)
     pbc_side: int = -1     # 0/1: declared side of an (anti)periodic pair; -1 = n/a
+    pbc_partner: int = -1  # index of the paired segment on the other side (-1 = none).
+                           # Set per entity pair by build_pbc_twin_from_cdt and kept
+                           # current through splits, so refinement never recovers the
+                           # partner from node twins: a node at a corner shared by two
+                           # paired boundaries has two partners, and the one-entry twin
+                           # map holds only one. Both sides are oriented to the CDT
+                           # (interior on the left), so a segment and its partner run
+                           # opposite ways and partner.v0 corresponds to this v1.
 
 
 @dataclass
@@ -2274,7 +2282,7 @@ def refine_quality(mesh, opts, n_input_verts):
         seg = Segment(mesh.segments[si].v0, mesh.segments[si].v1,
                       mesh.segments[si].marker, mesh.segments[si].lfs,
                       mesh.segments[si].pbc_type, mesh.segments[si].no_split,
-                      mesh.segments[si].pbc_side)
+                      mesh.segments[si].pbc_side, mesh.segments[si].pbc_partner)
         sa, sb = mesh.vertices[seg.v0], mesh.vertices[seg.v1]
         t = t_frac if 0.0 < t_frac < 1.0 else split_fraction(si)
         mx, my = sa.x + (sb.x - sa.x) * t, sa.y + (sb.y - sa.y) * t
@@ -2307,8 +2315,10 @@ def refine_quality(mesh, opts, n_input_verts):
         seg_adj[seg.v0] = [mid_idx if nb == seg.v1 else nb for nb in seg_adj[seg.v0]]
         seg_adj[seg.v1] = [mid_idx if nb == seg.v0 else nb for nb in seg_adj[seg.v1]]
         seg_adj[mid_idx] = [seg.v0, seg.v1]
-        s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_type, seg.no_split, seg.pbc_side)
-        s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_type, seg.no_split, seg.pbc_side)
+        s1 = Segment(seg.v0, mid_idx, seg.marker, seg.lfs, seg.pbc_type, seg.no_split,
+                     seg.pbc_side, seg.pbc_partner)
+        s2 = Segment(mid_idx, seg.v1, seg.marker, seg.lfs, seg.pbc_type, seg.no_split,
+                     seg.pbc_side, seg.pbc_partner)
         mesh.segments[si] = s1
         new_si = len(mesh.segments)
         mesh.segments.append(s2)
@@ -2326,34 +2336,40 @@ def refine_quality(mesh, opts, n_input_verts):
         """Split segment; for PBC segments, also split the partner."""
         seg = mesh.segments[si]  # read before split modifies it
         pbc_type = seg.pbc_type
-        sv0, sv1 = seg.v0, seg.v1
+        partner_si = seg.pbc_partner
         t_used = split_fraction(si)
         mid_idx = split_segment_core(si, out_affected, hint_tri, t_used)
         if mid_idx < 0:
             return False
 
-        # Synchronized PBC partner split
-        if pbc_type >= 0:
-            tv0 = mesh.pbc_twin.get(sv0, -1)
-            tv1 = mesh.pbc_twin.get(sv1, -1)
-            if tv0 >= 0 and tv1 >= 0:
-                pek = edge_key(tv0, tv1)
-                partner_si = edge_to_seg.get(pek, -1)
-                if partner_si >= 0:
-                    partner_affected = []
-                    # Split the partner at the SAME parametric position (oriented:
-                    # partner may be stored with endpoints in either order) so the
-                    # periodic boundaries keep matching node positions.
-                    pt = t_used if mesh.segments[partner_si].v0 == tv0 else 1.0 - t_used
-                    partner_mid = split_segment_core(partner_si, partner_affected, -1, pt)
-                    if partner_mid >= 0:
-                        mesh.pbc_twin[mid_idx] = partner_mid
-                        mesh.pbc_twin[partner_mid] = mid_idx
-                        mesh.pbc_node_type[mid_idx] = pbc_type
-                        mesh.pbc_node_type[partner_mid] = pbc_type
-                        # Add partner-affected triangles so the caller can
-                        # queue them for quality checking.
-                        out_affected.extend(partner_affected)
+        # Synchronized PBC partner split, at the same point along the boundary.
+        # The partner is the segment recorded on the entity pair (pbc_partner),
+        # not recovered from the endpoints' twins: at a corner shared by two
+        # paired boundaries the twin map holds only one of the node's two
+        # partners, and the lookup through it found the wrong segment or none,
+        # leaving splits unsynchronized (and the chain then silently unpaired).
+        if pbc_type >= 0 and partner_si >= 0:
+            new_si = len(mesh.segments) - 1       # s2 of this split
+            partner_affected = []
+            # Partner runs the opposite way (CDT orientation, see Segment), so
+            # the same point along the boundary is at 1-t from its v0.
+            partner_mid = split_segment_core(partner_si, partner_affected, -1, 1.0 - t_used)
+            if partner_mid >= 0:
+                p_new_si = len(mesh.segments) - 1  # p2 of the partner split
+                # si: v0->mid, new_si: mid->v1; partner_si: pv0->pmid, p_new_si: pmid->pv1.
+                # Opposite directions: v0 corresponds to pv1, so s1<->p2, s2<->p1.
+                mesh.segments[si].pbc_partner = p_new_si
+                mesh.segments[p_new_si].pbc_partner = si
+                mesh.segments[new_si].pbc_partner = partner_si
+                mesh.segments[partner_si].pbc_partner = new_si
+                mesh.pbc_twin[mid_idx] = partner_mid
+                mesh.pbc_twin[partner_mid] = mid_idx
+                mesh.pbc_node_type[mid_idx] = pbc_type
+                mesh.pbc_node_type[partner_mid] = pbc_type
+                # Add partner-affected triangles so the caller can
+                # queue them for quality checking.
+                out_affected.extend(partner_affected)
+            # else: the sides now differ; the check after refinement reports it.
         return True
 
     def find_encroached(px, py):
@@ -2740,6 +2756,14 @@ def read_poly_file(filename):
     for _ in range(ns):
         tokens, idx = read_tokens(lines, idx)
         v0, v1 = int(tokens[1]) - base, int(tokens[2]) - base
+        # An endpoint outside the vertex list would index pts out of range (or,
+        # for a negative index, silently wrap to the end of the list). Refuse it,
+        # naming the vertex in the file's own numbering.
+        for v in (v0, v1):
+            if not 0 <= v < len(pts):
+                raise ValueError(
+                    f"segment {tokens[0]} references vertex {v + base} but the file "
+                    f"has {len(pts)} vertices (numbered from {base})")
         marker = int(tokens[3]) if smark > 0 else 0
         lfs_col = 3 + (1 if smark > 0 else 0)
         lfs = float(tokens[lfs_col]) if len(tokens) > lfs_col else -1.0
@@ -2779,6 +2803,11 @@ def read_poly_file(filename):
             arc_first = len(segs)
             v0_raw, v1_raw = int(tokens[1]), int(tokens[2])
             v0a, v1a = v0_raw - base, v1_raw - base
+            for v in (v0a, v1a):
+                if not 0 <= v < len(pts):
+                    raise ValueError(
+                        f"arc {tokens[0]} references vertex {v + base} but the file "
+                        f"has {len(pts)} vertices (numbered from {base})")
             angle = float(tokens[3])
             max_seg_angle = float(tokens[4])
             col = 5
@@ -3114,6 +3143,12 @@ def build_pbc_twin_from_cdt(mesh):
             if t.v[best_j] == s.v1 and t.v[(best_j+1)%3] == s.v0:
                 s.v0, s.v1 = s.v1, s.v0
 
+    # Edge -> PBC segment index, for recording segment partners below.
+    pbc_edge_seg = {}
+    for si, sg in enumerate(mesh.segments):
+        if sg.pbc_type >= 0:
+            pbc_edge_seg[edge_key(sg.v0, sg.v1)] = si
+
     # Group PBC segments by boundary {marker, pbc_type}.
     pbc_boundaries = set()
     for s in mesh.segments:
@@ -3281,14 +3316,35 @@ def build_pbc_twin_from_cdt(mesh):
             for i in range(len(chain1)):
                 a, b = chain1[i], chain2[i]
                 # a==b happens when the two sides of a boundary adjoin: the
-                # shared node is its own twin. Record it -- the refinement
-                # partner-split lookup needs the entry, and the pair reaches
+                # shared node is its own twin. Record it -- the pair reaches
                 # the .pbc output (anti-periodic: A = -A pins A = 0 there,
-                # matching original FEMM).
+                # matching original FEMM). One twin per node is all the
+                # constraint system needs: where a node sits on two paired
+                # boundaries (a Kelvin exterior's corner, on a periodic arc
+                # and an anti-periodic diameter) the second pairing is implied
+                # by the others, so whichever is recorded is consistent.
                 mesh.pbc_twin[a] = b
                 mesh.pbc_twin[b] = a
                 mesh.pbc_node_type[a] = pbc_type
                 mesh.pbc_node_type[b] = pbc_type
+            # Pair the SEGMENTS of the two chains, edge by edge, as OF's
+            # FunnyOnWritePoly subdivides paired entities in lockstep. This is
+            # what refinement uses to split both sides identically; node twins
+            # cannot answer it at a shared corner (see Segment.pbc_partner).
+            for i in range(len(chain1) - 1):
+                sa = pbc_edge_seg.get(edge_key(chain1[i], chain1[i + 1]), -1)
+                sb = pbc_edge_seg.get(edge_key(chain2[i], chain2[i + 1]), -1)
+                if sa < 0 or sb < 0:
+                    print("Warning: PBC chain edge has no segment; partner not recorded",
+                          file=sys.stderr)
+                    continue
+                # Both sides are oriented to the CDT, so paired segments must run
+                # opposite ways; refinement relies on it (partner split at 1-t).
+                if (mesh.segments[sa].v0 == chain1[i]) == (mesh.segments[sb].v0 == chain2[i]):
+                    print("Warning: paired PBC segments run the same direction; "
+                          "the two sides will not stay synchronized", file=sys.stderr)
+                mesh.segments[sa].pbc_partner = sb
+                mesh.segments[sb].pbc_partner = sa
             new_pairs.append((chain1, chain2, pbc_type, True))
             progress = True
         bdry_pairs = new_pairs
@@ -3507,6 +3563,32 @@ def main():
     if not opts.quiet:
         print(f"  Refinement: {elapsed():.1f} ms", file=sys.stderr)
 
+    # 5b. Every (anti)periodic segment must still have a mutual partner and
+    # twinned endpoints. If the two sides of a boundary were split differently,
+    # the pairing is incomplete and the solver would quietly treat the unpaired
+    # stretch as a free boundary, which is never what a periodic boundary means:
+    # fail instead. (A boundary whose pairing build_pbc_twin_from_cdt already
+    # declined -- missing side, mismatched chains -- has no partner and fails the
+    # same way.) Keyed on the segments, not on pbc_twin being non-empty: when the
+    # model's ONLY periodic boundary failed to pair, the twin map is empty and
+    # that is precisely the silent free boundary to refuse.
+    n_seg = len(mesh.segments)
+    bad = 0
+    for si, sg in enumerate(mesh.segments):
+        if sg.pbc_type < 0:
+            continue
+        ps = sg.pbc_partner
+        ok = (0 <= ps < n_seg and mesh.segments[ps].pbc_partner == si
+              and sg.v0 in mesh.pbc_twin and sg.v1 in mesh.pbc_twin)
+        if not ok:
+            bad += 1
+    if bad:
+        print(f"Error: {bad} (anti)periodic boundary segment(s) have no matching "
+              "partner after refinement: the two sides of a periodic boundary were "
+              "not meshed identically, so the boundary cannot be paired.",
+              file=sys.stderr)
+        return TANGLE_ERR_MESH
+
     # 7. Final cleanup: compact dead triangles, then extract edges.  Adjacency is
     # maintained incrementally during refinement (insert_point_lawson keeps
     # neighbors[] correct), so instead of rebuilding it from scratch we remap the
@@ -3538,17 +3620,26 @@ def main():
               "boundary segments that do not enclose a region.", file=sys.stderr)
         return TANGLE_ERR_MESH
 
-    # Convert PBC twin map to output pairs
+    # Output pairs: one per paired segment end, as OF emits them per entity. A
+    # node on two paired boundaries (a Kelvin exterior's corner, on a periodic
+    # arc and an anti-periodic diameter) then appears in two pairs, each with
+    # its own type, and the solver's constraint classes stay connected. The twin
+    # map is a matching -- one partner per node -- and emitting from it dropped
+    # one of a shared corner's two pairs, which one depending on the order the
+    # boundaries were processed. Self-pairs (a==b) are kept: a node shared by
+    # both sides of an adjoining boundary is its own twin, and original FEMM
+    # emits the pair so the solver constrains it (anti-periodic -> A=0).
     seen_pbc = set()
-    for a, b in mesh.pbc_twin.items():
-        # Self-pairs (a==b) are kept: a node shared by both sides of an
-        # adjoining boundary is its own twin, and original FEMM emits the
-        # pair so the solver constrains it (anti-periodic -> A=0).
-        key = (min(a, b), max(a, b))
-        if key not in seen_pbc:
-            seen_pbc.add(key)
-            pbc_type = mesh.pbc_node_type.get(a, 0)
-            mesh.pbc_pairs.append(PBCNodePair(a, b, pbc_type))
+    for sg in mesh.segments:
+        if sg.pbc_type < 0 or sg.pbc_partner < 0:
+            continue
+        pg = mesh.segments[sg.pbc_partner]
+        # Partner runs the opposite way (see Segment): v0<->p.v1, v1<->p.v0.
+        for a, b in ((sg.v0, pg.v1), (sg.v1, pg.v0)):
+            key = (min(a, b), max(a, b), sg.pbc_type)
+            if key not in seen_pbc:
+                seen_pbc.add(key)
+                mesh.pbc_pairs.append(PBCNodePair(a, b, sg.pbc_type))
 
     # Jettison
     if opts.jettison:
