@@ -9,8 +9,8 @@ Author: David Meeker
 Generated with the assistance of Claude Code
 Translated from tangle.cpp
 
-Version 0.4.20
-29 Oct 2026
+Version 0.4.21
+01 Nov 2026
 
 Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 
