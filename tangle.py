@@ -3004,9 +3004,12 @@ def write_poly_file(fn, mesh, opts):
 
 def write_pbc_file(fn, mesh, opts):
     with open_retry(fn, 'w') as f:
+        # Same numbering as the .node/.ele/.edge files (-z selects 0-based);
+        # this used to be 0-based always, one node low without -z.
+        off = 0 if opts.zero_indexed else 1
         f.write(f"{len(mesh.pbc_pairs)}\n")
         for i, p in enumerate(mesh.pbc_pairs):
-            f.write(f"{i}\t{p.node_a}\t{p.node_b}\t{p.type}\n")
+            f.write(f"{i + off}\t{p.node_a + off}\t{p.node_b + off}\t{p.type}\n")
 
 
 

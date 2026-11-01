@@ -180,6 +180,30 @@ heatcheck heat_per  0    # heat periodic is 4
 heatcheck heat_anti 1    # heat anti-periodic is 5
 heatcheck strips    0    # .fee periodic is 3
 
+# .pbc node numbers must index the .node file written alongside it (same base,
+# -z or not). wedge_pbc is a periodic ROTATION about the origin, so every pair
+# must join two nodes of equal radius; an off-by-one in the .pbc numbering (it
+# was always 0-based while .node is 1-based without -z) breaks that at once.
+if [ -f wedge_pbc.1.node ] && [ -f wedge_pbc.1.pbc ]; then
+  res=$(python - wedge_pbc.1.node wedge_pbc.1.pbc <<'PY3'
+import sys, math
+L = open(sys.argv[1]).read().splitlines(); n = int(L[0].split()[0])
+V = {}
+for r in L[1:n+1]:
+    t = r.split(); V[int(t[0])] = (float(t[1]), float(t[2]))
+P = open(sys.argv[2]).read().splitlines(); m = int(P[0]); bad = 0
+for r in P[1:m+1]:
+    t = r.split(); a, b = int(t[1]), int(t[2])
+    if a not in V or b not in V or abs(math.hypot(*V[a]) - math.hypot(*V[b])) > 1e-6 * math.hypot(*V[a]):
+        bad += 1
+print(m, bad)
+PY3
+)
+  read m bad <<< "$res"
+  [ "${bad:-1}" = 0 ] && [ "${m:-0}" -gt 0 ] && ok=1 || ok=0
+  check "wedge_pbc .pbc numbering" $ok "$m pairs, $bad not equal-radius in .node numbering"
+fi
+
 printf -- "----------------------------------------------------------------------\n"
 printf "PASS=%d  FAIL=%d  SKIP=%d\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]

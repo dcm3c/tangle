@@ -8,8 +8,8 @@
 // Author: David Meeker
 // Generated with the assistance of Claude Code
 //
-// Version 0.4.20
-// 29 Oct 2026
+// Version 0.4.21
+// 01 Nov 2026
 //
 // Supports: -p -P -j -q -e -A -a -z -Q -I -Y options
 //
@@ -4276,10 +4276,15 @@ void writePbcFile(const std::string& fn, const Mesh& mesh, const Options& opts){
     if(!openWithRetry(f, fn, std::ios::out, false))
         std::cerr<<"Cannot open output file "<<fn<<"\n";
     f<<std::setprecision(17);
+    // Node references (and row indices) use the same numbering as the .node,
+    // .ele and .edge files written alongside (-z selects 0-based). They were
+    // always 0-based here, so without -z every pair pointed one node low in
+    // the .node file it belongs to. The FEMM path forces -z: unchanged there.
+    const int off = opts.zero_indexed ? 0 : 1;
     f<<mesh.pbc_pairs.size()<<"\n";
     for(int i=0;i<(int)mesh.pbc_pairs.size();i++){
         auto& p=mesh.pbc_pairs[i];
-        f<<i<<" "<<p.node_a<<" "<<p.node_b<<" "<<p.type<<"\n";
+        f<<(i+off)<<" "<<(p.node_a+off)<<" "<<(p.node_b+off)<<" "<<p.type<<"\n";
     }
 
     // Write AGE definitions
@@ -4371,10 +4376,10 @@ void writePbcFile(const std::string& fn, const Mesh& mesh, const Options& opts){
             int p1=i; if(p1>=n0) p1=0;
             int p0=p1-1; if(p0<0) p0=n0+p0;
 
-            f<<innerRing[p0].node<<" "<<innerRing[p0].sign<<" "
-             <<innerRing[p1].node<<" "<<innerRing[p1].sign<<" "
-             <<outerRing[p0].node<<" "<<outerRing[p0].sign<<" "
-             <<outerRing[p1].node<<" "<<outerRing[p1].sign<<"\n";
+            f<<(innerRing[p0].node+off)<<" "<<innerRing[p0].sign<<" "
+             <<(innerRing[p1].node+off)<<" "<<innerRing[p1].sign<<" "
+             <<(outerRing[p0].node+off)<<" "<<outerRing[p0].sign<<" "
+             <<(outerRing[p1].node+off)<<" "<<outerRing[p1].sign<<"\n";
         }
     }
 }
